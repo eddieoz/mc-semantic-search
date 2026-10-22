@@ -53,6 +53,7 @@ def _cmd_stats_backfill(args: argparse.Namespace) -> int:
     report = run_stats_backfill(
         fetch_missing=args.fetch_missing,
         limit=args.limit,
+        from_db=args.from_db,
         client=client,
     )
     # summary() has no trailing newline; a plain print terminates the line so

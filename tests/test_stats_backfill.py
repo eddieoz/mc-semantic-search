@@ -737,9 +737,11 @@ def test_from_db_clears_episode_when_title_declares_none(tmp_path):
     assert cached["episode"] is None
 
 
-def test_from_db_agreeing_row_is_skipped_and_index_untouched(tmp_path):
-    """A row whose episode already matches the title-derived value is simply
-    resumable — no redundant writes, no repeated index traffic."""
+def test_from_db_resyncs_payload_episode_even_when_row_agrees(tmp_path):
+    """The payload can lag the row: a row whose episode already matches the
+    title-derived value is still re-synced at the index, so a stale payload
+    (e.g. left over from before this repair existed) is overwritten with the
+    truth rather than skipped as "done"."""
     state, cache_dir, transcripts_dir = _ctx(tmp_path)
     state.record_video_stats("abc747ok123", duration=100, episode=747, date="2025-03-16")
     _write_cache(
@@ -769,9 +771,12 @@ def test_from_db_agreeing_row_is_skipped_and_index_untouched(tmp_path):
         collection="c",
     )
 
-    assert report["videos_skipped"] == 1
-    assert report["episodes_repaired"] == 0
-    assert spy.calls == [] and spy.deletes == []
+    assert report["videos_skipped"] == 0  # title-bearing rows are never skipped
+    assert report["episodes_repaired"] == 0  # the row itself needed no repair
+    episode_calls = [c for c in spy.calls if "episode" in c["payload"]]
+    assert episode_calls and episode_calls[0]["payload"]["episode"] == "747"
+    assert not _targets_empty_field(episode_calls[0]["points"], "episode")
+    assert spy.deletes == []
 
 
 def test_from_db_video_missing_from_titles_keeps_normal_flow(tmp_path):

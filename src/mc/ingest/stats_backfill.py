@@ -316,10 +316,14 @@ def run_stats_backfill(
         # resolution and the index repair. Checking every field, not just the
         # duration, is what lets a video that already had a duration still gain
         # its missing episode/date (the old duration-only skip left them NULL).
-        # Rows the title proves wrong are never "done".
+        # Rows the title proves wrong are never "done". And when --from-db is
+        # given the title is authoritative for the payload too, so a title-
+        # bearing video is never skipped: its payload episode is re-synced to
+        # the truth even when the row already agrees (the payload may lag).
         if (
             all(current[field] is not None for field in ("duration", "episode", "date"))
             and not episode_repair_needed
+            and not has_title
         ):
             report.videos_skipped += 1
             continue
@@ -367,16 +371,25 @@ def run_stats_backfill(
                 "episode": (str(facts["episode"]) if facts["episode"] is not None else None),
                 "date": facts["date"],
             }
-            missing = {
-                f: v
-                for f, v in pending.items()
-                if current[f] is None or (f == "episode" and episode_repair_needed)
-            }
+            missing = {f: v for f, v in pending.items() if current[f] is None}
             overwrite: set[str] = set()
             clear: set[str] = set()
             if poisoned:
                 overwrite.add("episode")
-            if episode_repair_needed:
+            if has_title:
+                # the title is authoritative for the payload episode: overwrite
+                # any stale value (junk or otherwise) with the truth, or clear
+                # it when the title declares none. The row may already agree
+                # while the payload lags behind, so this runs whenever --from-db
+                # is in effect — not only when the row itself needed repair.
+                if facts["episode"] is not None:
+                    overwrite.add("episode")
+                    missing["episode"] = str(facts["episode"])
+                else:
+                    clear.add("episode")
+                    missing.pop("episode", None)
+            elif episode_repair_needed:
+                # no title: only a poison hit forces a replace
                 if facts["episode"] is not None:
                     overwrite.add("episode")
                 else:
