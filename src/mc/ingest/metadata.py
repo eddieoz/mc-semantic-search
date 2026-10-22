@@ -25,7 +25,9 @@ Fetcher = Callable[[str], dict]
 
 _YOUTUBE_URL = "https://www.youtube.com/watch?v={video_id}"
 _EPISODE_RE = r"#(\d+)"
-_FALLBACK_DIGITS_RE = r"\d+"
+#: ``[ Morning Crypto ][ ep 441 ]``, ``EP. 372`` — the archive's real marker
+#: (case-insensitive; a doubled space between the word and the number).
+_EP_WORD_RE = re.compile(r"\bep\.?\s*(\d+)", re.IGNORECASE)
 _MAX_ATTEMPTS = 3
 _YTDLP_TIMEOUT_S = 120
 
@@ -99,12 +101,15 @@ def _default_fetch(video_id: str) -> dict:
 
 
 def _parse_episode(title: str) -> str | None:
-    """Episode number from the title: prefer ``#N``, else the last digit run."""
-    match = re.search(_EPISODE_RE, title)
-    if match:
-        return match.group(1)
-    digits = re.findall(_FALLBACK_DIGITS_RE, title)
-    return digits[-1] if digits else None
+    """Episode number from the title: ``#N`` or the ``ep N`` marker.
+
+    There is deliberately NO bare-digit fallback: a title's leftover digit
+    runs are dates, prices and milestones, never episodes ("[ IRL ][ ep 567 ]
+    DeSci Nordics 2024" must parse as 567, not 2024; "Nunca use 123456" has
+    no episode at all). A title that declares no episode parses as None.
+    """
+    match = re.search(_EPISODE_RE, title) or _EP_WORD_RE.search(title)
+    return match.group(1) if match else None
 
 
 def episode_int(episode: str | int | None) -> int | None:

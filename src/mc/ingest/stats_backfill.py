@@ -19,6 +19,12 @@ Fact resolution (fills NULLs only; duration precedence: cache > transcripts):
      which fires whenever ANY fact is still missing (duration, episode or
      date — old pre-enrichment videos carry none) and upgrades the cache file
      with everything it learns (once ever; known fields are never regressed)
+  ④ placeholder-title poison repair: a bot-gated yt-dlp can exit 0 with a
+     degraded dump whose title is ``youtube video #<id>``, which seeded
+     id-digit junk episodes into caches, rows and payloads. An episode whose
+     digits occur inside the video id in a durationless cache entry is treated
+     as MISSING (never as knowledge) and healed by ③; the payload value is
+     overwritten, not preserved.
 
 No fetch happens by default, so a run over ~3.5k videos is seconds of local
 JSON parsing and never exposes a datacenter IP to YouTube bot detection.
@@ -110,6 +116,21 @@ def _load_cache(cache_dir: Path, video_id: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _poisoned_episode(video_id: str, cache: dict) -> bool:
+    """True when the cached episode is a placeholder-title artifact.
+
+    A bot-gated yt-dlp can exit 0 with a degraded dump whose title is the
+    placeholder ``youtube video #<video_id>``; the episode parser then read
+    digits from the video id itself ("xg301415xZU" → 301415, "--5z_jFh-_g"
+    → 5), and MAX(episode) crowned a nonsense "último episódio". Marker: the
+    entry carries no duration (degraded dumps never write the key — real
+    fetches always do) AND the episode's digits occur inside the video id."""
+    if "duration" in cache:
+        return False
+    episode = episode_int(cache.get("episode"))
+    return episode is not None and str(episode) in video_id
+
+
 def _cache_ids(cache_dir: Path) -> set[str]:
     if not cache_dir.exists():
         return set()
@@ -172,27 +193,29 @@ def _repair_payload(
     collection: str,
     video_id: str,
     facts: dict,
+    overwrite: set[str] | None = None,
 ) -> int:
     """Fill this video's payloads where a fact is missing (Story 6.4 index repair).
 
     One ``set_payload`` per field — payload-only, no re-embedding — each scoped
     by a filter that requires the ``video_id`` AND that the field is still
     empty. A value the index already carries is therefore never overwritten,
-    which keeps the whole operation idempotent and safe to re-run. Returns how
-    many fields were offered (0 → nothing to do)."""
+    which keeps the whole operation idempotent and safe to re-run. Fields named
+    in ``overwrite`` drop that is-empty guard: a poisoned value (junk parsed
+    from a placeholder title) must be REPLACED even though the field is not
+    empty. Returns how many fields were offered (0 → nothing to do)."""
+    overwrite = overwrite or set()
     offered = 0
     for field, value in facts.items():
         if value is None:
             continue
+        must = [models.FieldCondition(key="video_id", match=models.MatchValue(value=video_id))]
+        if field not in overwrite:
+            must.append(models.IsEmptyCondition(is_empty=models.PayloadField(key=field)))
         client.set_payload(
             collection_name=collection,
             payload={field: value},
-            points=models.Filter(
-                must=[
-                    models.FieldCondition(key="video_id", match=models.MatchValue(value=video_id)),
-                    models.IsEmptyCondition(is_empty=models.PayloadField(key=field)),
-                ]
-            ),
+            points=models.Filter(must=must),
         )
         offered += 1
     return offered
@@ -236,7 +259,17 @@ def run_stats_backfill(
             break
         report.videos_considered += 1
 
+        cache = _load_cache(cache_dir, video_id)
+        # A poisoned episode is not knowledge: neutralize it in both the cache
+        # view and the row view, so the resolution re-fetches it and the index
+        # repair REPLACES the junk instead of preserving it.
+        poisoned = _poisoned_episode(video_id, cache)
+        if poisoned:
+            cache = {**cache, "episode": None}
+
         current = state.video_facts(video_id)
+        if poisoned:
+            current = {**current, "episode": None}
         # Resumable in BOTH modes: a row that already carries duration, episode
         # AND date has nothing left to fill — skip the (possibly expensive)
         # resolution and the index repair. Checking every field, not just the
@@ -246,7 +279,6 @@ def run_stats_backfill(
             report.videos_skipped += 1
             continue
 
-        cache = _load_cache(cache_dir, video_id)
         facts, fetched = _resolve_facts(
             video_id,
             cache,
@@ -279,7 +311,13 @@ def run_stats_backfill(
             }
             missing = {f: v for f, v in pending.items() if current[f] is None}
             try:
-                if _repair_payload(client, collection, video_id, missing):
+                if _repair_payload(
+                    client,
+                    collection,
+                    video_id,
+                    missing,
+                    overwrite={"episode"} if poisoned else set(),
+                ):
                     report.index_updated += 1
             except Exception:  # noqa: BLE001 — repair must never fail the run
                 logger.warning("index payload repair failed for %s", video_id, exc_info=True)

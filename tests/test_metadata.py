@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from mc.ingest.metadata import _normalize, duration_int, enrich, episode_int
+from mc.ingest.metadata import (
+    _normalize,
+    _parse_episode,
+    duration_int,
+    enrich,
+    episode_int,
+)
 
 
 def _payload(video_id: str, **overrides) -> dict:
@@ -156,6 +162,33 @@ def test_episode_int_none_for_garbage():
     assert episode_int("garbage") is None
     assert episode_int("") is None
     assert episode_int(None) is None
+
+
+# --- Episode parsing — the archive's real title format ----------------------
+#
+# Titles declare the episode as ``[ Morning Crypto ][ ep 441 ]`` / ``EP. N``
+# (sometimes with a doubled space). The old bare-digit fallback turned dates,
+# prices and milestones into episodes — "[ IRL ][ ep 567 ] DeSci Nordics
+# 2024" became "2024", "Nunca use 123456" became 123456 and poisoned
+# MAX(episode) on the landing page. A title must DECLARE its episode; bare
+# digit runs are never episodes.
+
+
+def test_episode_parsed_from_ep_word_marker():
+    assert _parse_episode("[ IRL ][ ep 567 ] DeSci Nordics 2024") == "567"
+    assert _parse_episode("[ Morning Crypto ][ ep  371 ] Nostr") == "371"  # doubled space
+    assert _parse_episode("[ Morning Crypto ][ EP. 372 ] Treta, FTX") == "372"
+
+
+def test_episode_prefers_hash_marker_over_ep_word():
+    assert _parse_episode("EP #971 (also says ep 500)") == "971"
+
+
+def test_episode_none_for_bare_digit_runs():
+    assert _parse_episode("Nunca use 123456  Proteja seu Access Code") is None
+    assert _parse_episode("Tinha pool de Bitcoin em 2009?") is None
+    assert _parse_episode("Fireside Chat: ETH Tallinn April/2024") is None
+    assert _parse_episode("BITCOIN: O PLANO SECRETO") is None
 
 
 # --- Story 6.1 — duration_int (numeric seconds for storage/aggregates) ------

@@ -497,3 +497,140 @@ def test_fetch_missing_fires_for_a_cache_entry_lacking_episode_and_date(tmp_path
     cached = json.loads((cache_dir / "v1.json").read_text())
     assert cached["episode"] == "971"
     assert cached["date"] == "2026-10-20"
+
+
+# --- Placeholder-title poison (degraded yt-dlp dumps) -----------------------
+#
+# A bot-gated yt-dlp (old version) exits 0 with a degraded dump whose title is
+# literally "youtube video #<video_id>", so the episode parser read digits out
+# of the VIDEO ID ("xg301415xZU" → 301415, "--5z_jFh-_g" → 5) and the landing
+# page crowned "último episódio #301415". Marker: the cache entry carries no
+# duration (degraded dumps never do; real fetches always write the key) AND
+# the episode's digits occur inside the video id.
+
+
+def test_transcript_duration_does_not_complete_a_poisoned_row(tmp_path):
+    """With transcripts on disk the duration resolves offline — a poisoned row
+    must NOT be completed by it (that would make the junk id-derived episode
+    permanent), so the fetch still fires to heal the episode."""
+    state, cache_dir, transcripts_dir = _ctx(tmp_path)
+    _write_cache(
+        cache_dir,
+        "--5z_jFh-_g",
+        {"date": "2021-09-21", "episode": "5", "channel": "EddieOz"},
+    )
+    _write_transcript(transcripts_dir, "--5z_jFh-_g", [{"start": 0.0, "duration": 9114.0}])
+
+    def fake_fetch(_vid):
+        return {"upload_date": "20210921", "title": "EP #88", "duration": 9114}
+
+    report = run_stats_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        transcripts_dir=transcripts_dir,
+        fetch_missing=True,
+        fetch=fake_fetch,
+        sleeper=lambda _: None,
+    )
+    assert report["fetched"] == 1
+    assert state.archive_stats()["last_episode"] == 88
+
+
+def test_poisoned_row_completed_by_transcript_pass_is_healed_by_fetch_pass(tmp_path):
+    """Pass 1 (no fetch) fills the duration from the transcript. Pass 2 with
+    --fetch-missing must NOT treat that poisoned row as done."""
+    state, cache_dir, transcripts_dir = _ctx(tmp_path)
+    _write_cache(
+        cache_dir,
+        "--5z_jFh-_g",
+        {"date": "2021-09-21", "episode": "5", "channel": "EddieOz"},
+    )
+    _write_transcript(transcripts_dir, "--5z_jFh-_g", [{"start": 0.0, "duration": 9114.0}])
+
+    run_stats_backfill(state=state, cache_dir=cache_dir, transcripts_dir=transcripts_dir)
+    assert state.video_facts("--5z_jFh-_g")["duration"] == 9114
+
+    report = run_stats_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        transcripts_dir=transcripts_dir,
+        fetch_missing=True,
+        fetch=lambda _v: {"upload_date": "20210921", "title": "EP #88", "duration": 9114},
+        sleeper=lambda _: None,
+    )
+    assert report["videos_skipped"] == 0
+    assert report["fetched"] == 1
+    assert state.video_facts("--5z_jFh-_g")["episode"] == 88
+
+
+def test_poisoned_payload_episode_is_overwritten_not_preserved(tmp_path):
+    """The broken run already wrote the junk episode into the Qdrant payloads —
+    the healed value must OVERWRITE it, so for a poisoned video the episode
+    repair drops the is-empty guard (duration/date still fill empties only)."""
+    state, cache_dir, transcripts_dir = _ctx(tmp_path)
+    _write_cache(
+        cache_dir,
+        "--5z_jFh-_g",
+        {"date": "2021-09-21", "episode": "5", "channel": "EddieOz"},
+    )
+    spy = _SpyClient()
+
+    run_stats_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        transcripts_dir=transcripts_dir,
+        fetch_missing=True,
+        fetch=lambda _v: {"upload_date": "20210921", "title": "EP #88", "duration": 9114},
+        sleeper=lambda _: None,
+        client=spy,
+        collection="c",
+    )
+    episode_calls = [c for c in spy.calls if "episode" in c["payload"]]
+    assert episode_calls, "the healed episode must reach the index"
+    assert episode_calls[0]["payload"]["episode"] == "88"
+    assert not _targets_empty_field(episode_calls[0]["points"], "episode")
+    for call in spy.calls:
+        if "episode" not in call["payload"]:
+            assert _targets_empty_field(call["points"], next(iter(call["payload"])))
+
+
+def test_real_fetch_cache_is_never_treated_as_poison(tmp_path):
+    """The marker requires a durationless cache entry: a real fetch (which
+    always writes the duration key) is trusted even when the episode digits
+    occur inside the video id."""
+    state, cache_dir, transcripts_dir = _ctx(tmp_path)
+    state.record_video_stats("v5", duration=100, episode=5, date="2026-01-01")
+    _write_cache(cache_dir, "v5", {"episode": "5", "date": "2026-01-01", "duration": 100})
+
+    def boom(_vid):
+        raise AssertionError("a real-fetch cache entry must not be refetched")
+
+    report = run_stats_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        transcripts_dir=transcripts_dir,
+        fetch_missing=True,
+        fetch=boom,
+        sleeper=lambda _: None,
+    )
+    assert report["videos_skipped"] == 1
+    assert report["fetched"] == 0
+
+
+def test_poison_without_fetch_leaves_cache_and_row_untouched(tmp_path):
+    """Without --fetch-missing the poison is recognized (not 'known') but
+    nothing is erased: the row keeps its values and the cache file is not
+    rewritten — the next --fetch-missing run does the healing."""
+    state, cache_dir, transcripts_dir = _ctx(tmp_path)
+    state.record_video_stats("--5z_jFh-_g", duration=9114, episode=5, date="2021-09-21")
+    _write_cache(
+        cache_dir,
+        "--5z_jFh-_g",
+        {"date": "2021-09-21", "episode": "5", "channel": "EddieOz"},
+    )
+
+    report = run_stats_backfill(state=state, cache_dir=cache_dir, transcripts_dir=transcripts_dir)
+    assert report["fetched"] == 0
+    assert state.video_facts("--5z_jFh-_g")["episode"] == 5
+    cached = json.loads((cache_dir / "--5z_jFh-_g.json").read_text())
+    assert cached["episode"] == "5"
