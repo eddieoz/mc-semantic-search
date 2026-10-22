@@ -1,8 +1,8 @@
 {
   "id": "UC.example.channel",
   "entries": [
-    {"id": "vid1", "url": "https://www.youtube.com/watch?v=vid1"},
-    {"id": "vid2", "url": "https://www.youtube.com/watch?v=vid2"},
-    {"id": "vid3", "url": "https://www.youtube.com/watch?v=vid3"}
+    {"id": "vid1vid1vid", "url": "https://www.youtube.com/watch?v=vid1vid1vid"},
+    {"id": "vid2vid2vid", "url": "https://www.youtube.com/watch?v=vid2vid2vid"},
+    {"id": "vid3vid3vid", "url": "https://www.youtube.com/watch?v=vid3vid3vid"}
   ]
 }
