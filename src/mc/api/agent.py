@@ -116,6 +116,7 @@ def llms_txt(base_url: str | None = None) -> str:
             f"- [API /search]({api_url}): API JSON pura; limit 1–50 "
             "(padrão 10)",
             f"- [Manual /llms.txt]({manual_url}): este manual em texto puro",
+            f"- [Blog Eddieoz.com](https://eddieoz.com/llms.txt): Blog do EddieOz encontre artigos, documentos, entrevistas, tutoriais, apresentações e outros conteúdos",
             "",
             "## Campos de cada resultado",
             "",
