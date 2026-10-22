@@ -43,9 +43,11 @@ from qdrant_client import QdrantClient, models
 
 from mc import config
 from mc.config import COLLECTION_NAME
+from mc.ingest.legacy import iter_legacy_titles
 from mc.ingest.metadata import (
     _default_fetch,
     _normalize,
+    _parse_episode,
     duration_int,
     episode_int,
 )
@@ -65,6 +67,7 @@ class StatsBackfillReport:
     still_missing: int = 0  # duration still None after the run
     fetched: int = 0  # videos whose missing facts arrived via a yt-dlp fetch
     index_updated: int = 0  # videos whose payload gained a missing fact
+    episodes_repaired: int = 0  # rows whose episode was re-derived/cleared via --from-db
 
     def summary(self, stats: dict) -> str:
         seconds = int(stats.get("seconds") or 0)
@@ -75,6 +78,8 @@ class StatsBackfillReport:
             f"{stats['videos']} videos, {seconds} s "
             f"({seconds // 60} min, {seconds // 3600} h, {seconds // 86400} d)"
         )
+        if self.episodes_repaired:
+            line += f"; {self.episodes_repaired} episodes re-derived"
         if self.index_updated:
             line += f"; {self.index_updated} index payloads repaired"
         return line
@@ -194,6 +199,7 @@ def _repair_payload(
     video_id: str,
     facts: dict,
     overwrite: set[str] | None = None,
+    clear: set[str] | None = None,
 ) -> int:
     """Fill this video's payloads where a fact is missing (Story 6.4 index repair).
 
@@ -201,15 +207,27 @@ def _repair_payload(
     by a filter that requires the ``video_id`` AND that the field is still
     empty. A value the index already carries is therefore never overwritten,
     which keeps the whole operation idempotent and safe to re-run. Fields named
-    in ``overwrite`` drop that is-empty guard: a poisoned value (junk parsed
-    from a placeholder title) must be REPLACED even though the field is not
-    empty. Returns how many fields were offered (0 → nothing to do)."""
+    in ``overwrite`` drop that is-empty guard: a value known to be wrong
+    (placeholder-title poison, or one the authoritative title corrects) must
+    be REPLACED even though the field is not empty. Fields named in ``clear``
+    are REMOVED from the payload instead (``delete_payload``) — for a fact the
+    title proves should not exist at all. Returns how many operations were
+    offered (0 → nothing to do)."""
     overwrite = overwrite or set()
+    clear = clear or set()
     offered = 0
+    video_must = models.FieldCondition(key="video_id", match=models.MatchValue(value=video_id))
+    for field in sorted(clear):
+        client.delete_payload(
+            collection_name=collection,
+            keys=[field],
+            points=models.Filter(must=[video_must]),
+        )
+        offered += 1
     for field, value in facts.items():
         if value is None:
             continue
-        must = [models.FieldCondition(key="video_id", match=models.MatchValue(value=video_id))]
+        must = [video_must]
         if field not in overwrite:
             must.append(models.IsEmptyCondition(is_empty=models.PayloadField(key=field)))
         client.set_payload(
@@ -233,6 +251,7 @@ def run_stats_backfill(
     client: QdrantClient | None = None,
     collection: str = COLLECTION_NAME,
     repair_index: bool = True,
+    from_db: Path | None = None,
 ) -> dict:
     """Backfill the archive's per-video facts and repair the Qdrant payloads.
 
@@ -243,6 +262,12 @@ def run_stats_backfill(
     payloads (payload-only; only where the field is still empty). ``limit``
     bounds the number of videos considered this run. Returns a report dict; the
     operator-facing summary is printed by the CLI.
+
+    With ``from_db`` (a legacy ``mc_transcripts.db``), each video's chunked
+    title is the AUTHORITATIVE episode source: rows, cache files and payloads
+    are re-derived from it — a declared marker keeps (or gains) its episode,
+    and a marker-less title clears the junk the COALESCE upsert could never
+    erase. Fully offline; a run over ~3.5k videos is seconds of SQLite reads.
     """
     state = state or StateStore(config.INGEST_DB_PATH)
     cache_dir = Path(cache_dir) if cache_dir is not None else config.META_CACHE_DIR
@@ -250,6 +275,9 @@ def run_stats_backfill(
         Path(transcripts_dir) if transcripts_dir is not None else config.TRANSCRIPTS_DIR
     )
     fetcher = fetch if fetch is not None else (_default_fetch if fetch_missing else None)
+    titles: dict[str, str] | None = None
+    if from_db is not None:
+        titles = dict(iter_legacy_titles(Path(from_db)))
 
     report = StatsBackfillReport()
     universe = sorted(set(state.processed_ids()) | _cache_ids(cache_dir))
@@ -268,14 +296,31 @@ def run_stats_backfill(
             cache = {**cache, "episode": None}
 
         current = state.video_facts(video_id)
+        row_episode = current["episode"]
         if poisoned:
             current = {**current, "episode": None}
+
+        # --from-db: the title is the authoritative episode source — a row
+        # value that disagrees is junk to repair, not knowledge to keep.
+        title_episode: int | None = None
+        has_title = titles is not None and video_id in titles
+        if has_title:
+            title_episode = episode_int(_parse_episode(titles[video_id]))
+            cache = {**cache, "episode": title_episode}
+        episode_repair_needed = has_title and row_episode != title_episode
+        if episode_repair_needed:
+            report.episodes_repaired += 1
+
         # Resumable in BOTH modes: a row that already carries duration, episode
         # AND date has nothing left to fill — skip the (possibly expensive)
         # resolution and the index repair. Checking every field, not just the
         # duration, is what lets a video that already had a duration still gain
         # its missing episode/date (the old duration-only skip left them NULL).
-        if all(current[field] is not None for field in ("duration", "episode", "date")):
+        # Rows the title proves wrong are never "done".
+        if (
+            all(current[field] is not None for field in ("duration", "episode", "date"))
+            and not episode_repair_needed
+        ):
             report.videos_skipped += 1
             continue
 
@@ -298,9 +343,22 @@ def run_stats_backfill(
                 episode=facts["episode"],
                 date=facts["date"],
             )
+            if episode_repair_needed and title_episode is None:
+                # COALESCE can never erase — the authoritative clear is explicit
+                state.set_video_episode(video_id, None)
         except Exception:  # noqa: BLE001 — never fatal to the backfill
             logger.warning("stats write failed for %s", video_id, exc_info=True)
             continue
+
+        if has_title and (cache_dir / f"{video_id}.json").exists():
+            # write-through: a plain re-run (no --from-db) reads the cache and
+            # would re-junk the corrected row if the file kept the old value
+            stored = _load_cache(cache_dir, video_id)
+            wanted = str(title_episode) if title_episode is not None else None
+            if stored.get("episode") != wanted:
+                stored["episode"] = wanted
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                (cache_dir / f"{video_id}.json").write_text(json.dumps(stored), encoding="utf-8")
 
         if repair_index and client is not None:
             # the payload keeps episode as the string the ingest pipeline writes
@@ -309,14 +367,31 @@ def run_stats_backfill(
                 "episode": (str(facts["episode"]) if facts["episode"] is not None else None),
                 "date": facts["date"],
             }
-            missing = {f: v for f, v in pending.items() if current[f] is None}
+            missing = {
+                f: v
+                for f, v in pending.items()
+                if current[f] is None or (f == "episode" and episode_repair_needed)
+            }
+            overwrite: set[str] = set()
+            clear: set[str] = set()
+            if poisoned:
+                overwrite.add("episode")
+            if episode_repair_needed:
+                if facts["episode"] is not None:
+                    overwrite.add("episode")
+                else:
+                    # the title declares no episode: the junk must GO, not stay
+                    clear.add("episode")
+                    overwrite.discard("episode")
+                    missing.pop("episode", None)
             try:
                 if _repair_payload(
                     client,
                     collection,
                     video_id,
                     missing,
-                    overwrite={"episode"} if poisoned else set(),
+                    overwrite=overwrite,
+                    clear=clear,
                 ):
                     report.index_updated += 1
             except Exception:  # noqa: BLE001 — repair must never fail the run
@@ -336,6 +411,7 @@ def run_stats_backfill(
         "still_missing": report.still_missing,
         "fetched": report.fetched,
         "index_updated": report.index_updated,
+        "episodes_repaired": report.episodes_repaired,
         "videos": stats["videos"],
         "seconds": stats["seconds"],
         "summary": report.summary(stats),

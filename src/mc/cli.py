@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 
 def _cmd_backfill(args: argparse.Namespace) -> int:
@@ -128,6 +129,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="only write the stats table; do not repair the Qdrant payloads "
         "(the episode/date old points were indexed without)",
+    )
+    p.add_argument(
+        "--from-db",
+        type=Path,
+        default=None,
+        metavar="MC_TRANSCRIPTS_DB",
+        help="re-derive every episode from the chunked titles in a legacy "
+        "mc_transcripts.db (authoritative and offline; junk episodes are "
+        "cleared, rows/caches/payloads corrected)",
     )
     p.add_argument("--limit", type=int, default=None, help="cap videos considered this run")
     p.set_defaults(func=_cmd_stats_backfill)

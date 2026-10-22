@@ -63,8 +63,8 @@ class StateStore:
             if "not a database" not in str(exc):
                 raise
             logger.warning(
-                "state db %s is not a valid database — preserving it and "
-                "recreating from scratch", self.path
+                "state db %s is not a valid database — preserving it and recreating from scratch",
+                self.path,
             )
             self.path.replace(self.path.with_suffix(".corrupt"))
             self._conn = self._connect()
@@ -127,6 +127,21 @@ class StateStore:
                 (video_id, duration, episode, date),
             )
 
+    def set_video_episode(self, video_id: str, episode: int | None) -> None:
+        """Authoritative episode write — ``None`` CLEARS the stored value.
+
+        ``record_video_stats`` deliberately never erases (COALESCE), which is
+        right for ingest but wrong for repair: an episode known to be junk
+        (parsed from a placeholder title or a bare digit run) must be replaced
+        by the title-derived truth, including None. A missing row is a no-op —
+        the record path creates rows; repair only touches existing ones.
+        """
+        with self._conn:
+            self._conn.execute(
+                "UPDATE video_stats SET episode = ? WHERE video_id = ?",
+                (episode, video_id),
+            )
+
     def archive_stats(self) -> dict:
         """One cheap sqlite read of the archive numbers for the landing page.
 
@@ -134,9 +149,7 @@ class StateStore:
         ``None`` when no duration is known), and the (episode, date) pair of
         the highest known episode (numeric ORDER BY).
         """
-        total = self._conn.execute(
-            "SELECT COUNT(*), SUM(duration) FROM video_stats"
-        ).fetchone()
+        total = self._conn.execute("SELECT COUNT(*), SUM(duration) FROM video_stats").fetchone()
         last = self._conn.execute(
             "SELECT episode, date FROM video_stats "
             "WHERE episode IS NOT NULL ORDER BY episode DESC LIMIT 1"
@@ -192,9 +205,7 @@ class StateStore:
             )
 
     def get_key(self, key: str) -> str | None:
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key = ?", (key,)
-        ).fetchone()
+        row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row[0] if row else None
 
     # --- diagnostics ------------------------------------------------------------

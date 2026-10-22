@@ -155,3 +155,17 @@ def test_episode_ordering_is_numeric_not_lexical(tmp_path):
     stats = s.archive_stats()
     assert stats["last_episode"] == 1000
     assert stats["last_episode_date"] == "2026-01-02"
+
+
+def test_set_video_episode_overwrites_and_clears(tmp_path):
+    """The repair write: unlike record_video_stats's COALESCE (which never
+    erases), set_video_episode is authoritative — None CLEARS the junk."""
+    s = _store(tmp_path)
+    s.record_video_stats("v1", duration=100, episode=301415, date="2025-03-16")
+    s.set_video_episode("v1", 747)
+    assert s.video_facts("v1")["episode"] == 747
+    s.set_video_episode("v1", None)
+    assert s.video_facts("v1")["episode"] is None
+    assert s.video_facts("v1")["duration"] == 100  # untouched
+    s.set_video_episode("absent", 5)  # no row → no-op, no crash
+    assert s.video_facts("absent") == {"duration": None, "episode": None, "date": None}

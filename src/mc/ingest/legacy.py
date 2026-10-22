@@ -110,6 +110,27 @@ def iter_legacy_chunks(db_path: Path, quarantine_path: Path | None = None) -> It
         con.close()
 
 
+def iter_legacy_titles(db_path: Path) -> Iterator[tuple[str, str]]:
+    """Yield ``(video_id, title)`` once per distinct video, read-only.
+
+    The first row's title wins (chunks of one video share it). Feeds the
+    stats-backfill ``--from-db`` episode re-derivation: the chunked title is
+    the authoritative episode source, so a video whose title is absent or
+    empty is simply not overridden.
+    """
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        seen: set[str] = set()
+        for url, title in con.execute("SELECT url, title FROM transcripts"):
+            video_id = parse_video_id(url)
+            if video_id is None or video_id in seen or not title:
+                continue
+            seen.add(video_id)
+            yield video_id, title
+    finally:
+        con.close()
+
+
 def count_legacy(db_path: Path) -> dict:
     """Dry-run counts: total rows, parsed chunks, distinct videos, quarantined."""
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)

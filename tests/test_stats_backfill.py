@@ -237,9 +237,13 @@ class _SpyClient:
 
     def __init__(self):
         self.calls: list[dict] = []
+        self.deletes: list[dict] = []
 
     def set_payload(self, *, collection_name, payload, points):
         self.calls.append({"collection": collection_name, "payload": payload, "points": points})
+
+    def delete_payload(self, *, collection_name, keys, points):
+        self.deletes.append({"collection": collection_name, "keys": keys, "points": points})
 
     def payloads(self) -> list[dict]:
         return [call["payload"] for call in self.calls]
@@ -634,3 +638,169 @@ def test_poison_without_fetch_leaves_cache_and_row_untouched(tmp_path):
     assert state.video_facts("--5z_jFh-_g")["episode"] == 5
     cached = json.loads((cache_dir / "--5z_jFh-_g.json").read_text())
     assert cached["episode"] == "5"
+
+
+# --- --from-db: the chunked titles are the authoritative episode source -----
+#
+# The legacy mc_transcripts.db stores each video's real title. Re-deriving the
+# episode from it (new parser: declared markers only) repairs every junk form
+# at once — id digits parsed from a placeholder title (301415), and old-parser
+# bare-digit runs from real titles ("Nunca use 123456" → 123456) that the
+# resumability skip would otherwise preserve forever.
+
+
+def _write_legacy_db(path: Path, rows: list[tuple[str, str, str]]) -> None:
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE transcripts (title TEXT, url TEXT, description TEXT)")
+    con.executemany("INSERT INTO transcripts VALUES (?, ?, ?)", rows)
+    con.commit()
+    con.close()
+
+
+def test_from_db_title_overrides_junk_episode(tmp_path):
+    state, cache_dir, transcripts_dir = _ctx(tmp_path)
+    _write_cache(
+        cache_dir,
+        "abc747junk1",
+        {"date": "2025-03-16", "episode": "301415", "channel": "EddieOz"},
+    )
+    state.record_video_stats("abc747junk1", duration=100, episode=301415, date="2025-03-16")
+    db = tmp_path / "legacy.db"
+    _write_legacy_db(
+        db,
+        [
+            (
+                "[ IRL ][ ep 747 ] Shopping na Estonia",
+                "https://www.youtube.com/watch?v=abc747junk1&t=0",
+                "texto",
+            )
+        ],
+    )
+    spy = _SpyClient()
+
+    report = run_stats_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        transcripts_dir=transcripts_dir,
+        from_db=db,
+        client=spy,
+        collection="c",
+    )
+
+    assert state.video_facts("abc747junk1")["episode"] == 747
+    episode_calls = [c for c in spy.calls if "episode" in c["payload"]]
+    assert episode_calls, "the corrected episode must reach the index"
+    assert not _targets_empty_field(episode_calls[0]["points"], "episode")
+    # the cache file is corrected too, so a plain re-run cannot re-junk the row
+    cached = json.loads((cache_dir / "abc747junk1.json").read_text())
+    assert cached["episode"] == "747"
+    assert report["episodes_repaired"] == 1
+
+
+def test_from_db_clears_episode_when_title_declares_none(tmp_path):
+    """'Nunca use 123456' is not an episode: the row AND the payload must lose
+    the junk entirely — COALESCE alone can never erase a value."""
+    state, cache_dir, transcripts_dir = _ctx(tmp_path)
+    state.record_video_stats("abc123456x1", duration=100, episode=123456, date="2026-01-01")
+    _write_cache(
+        cache_dir,
+        "abc123456x1",
+        {"duration": 100, "episode": "123456", "date": "2026-01-01"},
+    )
+    db = tmp_path / "legacy.db"
+    _write_legacy_db(
+        db,
+        [
+            (
+                "Nunca use 123456  Proteja seu Access Code",
+                "https://www.youtube.com/watch?v=abc123456x1&t=0",
+                "t",
+            )
+        ],
+    )
+    spy = _SpyClient()
+
+    run_stats_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        transcripts_dir=transcripts_dir,
+        from_db=db,
+        client=spy,
+        collection="c",
+    )
+
+    assert state.video_facts("abc123456x1")["episode"] is None
+    assert spy.deletes and spy.deletes[0]["keys"] == ["episode"]
+    cached = json.loads((cache_dir / "abc123456x1.json").read_text())
+    assert cached["episode"] is None
+
+
+def test_from_db_agreeing_row_is_skipped_and_index_untouched(tmp_path):
+    """A row whose episode already matches the title-derived value is simply
+    resumable — no redundant writes, no repeated index traffic."""
+    state, cache_dir, transcripts_dir = _ctx(tmp_path)
+    state.record_video_stats("abc747ok123", duration=100, episode=747, date="2025-03-16")
+    _write_cache(
+        cache_dir,
+        "abc747ok123",
+        {"duration": 100, "episode": "747", "date": "2025-03-16"},
+    )
+    db = tmp_path / "legacy.db"
+    _write_legacy_db(
+        db,
+        [
+            (
+                "[ IRL ][ ep 747 ] Shopping na Estonia",
+                "https://www.youtube.com/watch?v=abc747ok123&t=0",
+                "t",
+            )
+        ],
+    )
+    spy = _SpyClient()
+
+    report = run_stats_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        transcripts_dir=transcripts_dir,
+        from_db=db,
+        client=spy,
+        collection="c",
+    )
+
+    assert report["videos_skipped"] == 1
+    assert report["episodes_repaired"] == 0
+    assert spy.calls == [] and spy.deletes == []
+
+
+def test_from_db_video_missing_from_titles_keeps_normal_flow(tmp_path):
+    """Only videos present in the legacy db get the title override; the rest
+    resolve exactly as before."""
+    state, cache_dir, transcripts_dir = _ctx(tmp_path)
+    state.mark_processed("abc999ok123", "update")
+    db = tmp_path / "legacy.db"
+    _write_legacy_db(
+        db,
+        [
+            (
+                "[ IRL ][ ep 747 ] Shopping na Estonia",
+                "https://www.youtube.com/watch?v=abc747junk1&t=0",
+                "t",
+            )
+        ],
+    )
+
+    report = run_stats_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        transcripts_dir=transcripts_dir,
+        from_db=db,
+        fetch_missing=True,
+        fetch=lambda _v: {"upload_date": "20261020", "title": "EP #999", "duration": 5400},
+        sleeper=lambda _: None,
+    )
+
+    stats = state.archive_stats()
+    assert stats["last_episode"] == 999
+    assert report["episodes_repaired"] == 0
