@@ -57,13 +57,10 @@ def _parse_file(path: Path) -> list[dict]:
     size = path.stat().st_size
     if size > _MAX_FILE_BYTES:
         raise ValueError(
-            f"file of {size} bytes exceeds the {_MAX_FILE_BYTES}-byte cap — "
-            "not loading into memory"
+            f"file of {size} bytes exceeds the {_MAX_FILE_BYTES}-byte cap — not loading into memory"
         )
     records: list[dict] = []
-    for lineno, raw in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         line = raw.strip()
         if not line:
             continue
@@ -106,18 +103,12 @@ def _group_chunks(records: list[dict]) -> dict[str, list[Chunk]]:
         # oversized/empty text) is untrusted queue input — fail the file.
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
             raise ValueError(
-                f"record for {chunk.video_id!r}: url must be an http(s) URL, "
-                f"got {url!r}"
+                f"record for {chunk.video_id!r}: url must be an http(s) URL, got {url!r}"
             )
         if not isinstance(text, str) or not text:
-            raise ValueError(
-                f"record for {chunk.video_id!r}: text must be a non-empty string"
-            )
+            raise ValueError(f"record for {chunk.video_id!r}: text must be a non-empty string")
         if len(text) > _MAX_TEXT_CHARS:
-            raise ValueError(
-                f"record for {chunk.video_id!r}: text exceeds "
-                f"{_MAX_TEXT_CHARS} chars"
-            )
+            raise ValueError(f"record for {chunk.video_id!r}: text exceeds {_MAX_TEXT_CHARS} chars")
         grouped.setdefault(chunk.video_id, []).append(chunk)
     return grouped
 
@@ -161,9 +152,7 @@ def run_apply(
         state = StateStore(Path(state))
     if client is None:
         client = QdrantClient(url=config.QDRANT_URL, **client_kwargs(timeout=30))
-    lock_path = (
-        Path(lock_path) if lock_path is not None else queue_dir.parent / _LOCK_NAME
-    )
+    lock_path = Path(lock_path) if lock_path is not None else queue_dir.parent / _LOCK_NAME
 
     report: dict = {
         "applied_chunks": 0,
@@ -207,22 +196,28 @@ def _apply_file(
         return
 
     if not pairs:
-        return  # every chunk in this file was already applied — nothing to do
+        # every chunk in this file was already applied — nothing new to
+        # upsert, but the videos must still enter Mode A's checkpoint (pre-fix
+        # Mode B runs recorded content hashes without mark_processed)
+        for video_id in {record["video_id"] for record in records}:
+            state.mark_processed(video_id, run_type="apply")
+        return
 
     applied_hashes: list[str] = []
     for video_id, chunks in sorted(chunks_by_video.items()):
         try:
             upsert_video(client, collection, video_id, chunks)
         except Exception:
-            logger.exception(
-                "upsert failed for %s — %s left for retry", video_id, path
-            )
+            logger.exception("upsert failed for %s — %s left for retry", video_id, path)
             continue
         hashes = [h for record, h in pairs if record["video_id"] == video_id]
         for h in hashes:  # mark only AFTER the atomic per-video upsert committed
             state.record_key(f"{_APPLIED_PREFIX}{h}", _now_iso())
         applied_hashes.extend(hashes)
         _record_stats(state, video_id, chunks[0])  # Story 6.3: archive stats
+        # Mode B's checkpoint: without this, a server-side `mc update` (Mode A)
+        # sees the video as undiscovered and re-attempts it.
+        state.mark_processed(video_id, run_type="apply")
 
     if applied_hashes:
         report["applied_chunks"] += len(applied_hashes)

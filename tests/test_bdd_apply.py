@@ -184,10 +184,12 @@ def other_files_applied(ctx):
 # --- Scenario: Applied increments update archive stats (Story 6.3) -----------
 
 
-@given(parsers.parse(
-    'an increment file carries a video with duration {duration:d}, '
-    'episode "{episode}", date "{date}"'
-))
+@given(
+    parsers.parse(
+        "an increment file carries a video with duration {duration:d}, "
+        'episode "{episode}", date "{date}"'
+    )
+)
 def increment_with_stats(ctx, duration, episode, date):
     records = [_record("statvid1", i) for i in range(3)]
     for r in records:
@@ -209,9 +211,7 @@ def apply_records_video_stats(ctx):
     assert stats["last_episode_date"] == "2026-10-20"
 
 
-@then(parsers.parse(
-    '"archive_stats()" reports seconds {seconds:d} and last episode {episode:d}'
-))
+@then(parsers.parse('"archive_stats()" reports seconds {seconds:d} and last episode {episode:d}'))
 def apply_stats_report(ctx, seconds, episode):
     stats = StateStore(ctx["state_db"]).archive_stats()
     assert stats["seconds"] == seconds
@@ -340,3 +340,40 @@ def test_stats_write_failure_does_not_fail_apply(ctx, monkeypatch):
     report = _run_apply(ctx)
     assert report["applied_chunks"] == 2  # upsert committed despite the failure
     assert _point_count(ctx) == 2
+
+
+# --- Mode B checkpoint: apply must mark videos processed ---------------------
+
+
+def test_apply_marks_video_processed(ctx):
+    """After apply the video is mark_processed — so a server-side `mc update`
+    (Mode A) will not re-attempt an already-indexed video: resumability
+    across both ingest modes."""
+    from mc.state import StateStore
+
+    _write_jsonl(
+        ctx["queue_dir"] / "2026-10-23.jsonl",
+        [_record("bddvid00002", i) for i in range(2)],
+    )
+    _run_apply(ctx)
+    assert StateStore(ctx["state_db"]).is_processed("bddvid00002")
+
+
+def test_apply_backfills_processed_for_already_applied_chunks(ctx):
+    """A file whose chunks were all applied earlier (hash keys present but the
+    video never mark_processed — the pre-fix Mode B state) still backfills
+    `processed` on re-apply, instead of early-returning and leaving the video
+    invisible to Mode A resumability forever."""
+    from mc.ingest.apply import _content_hash
+    from mc.state import StateStore
+
+    records = [_record("bddvid00003", i) for i in range(2)]
+    _write_jsonl(ctx["queue_dir"] / "2026-10-23b.jsonl", records)
+    state = StateStore(ctx["state_db"])
+    for record in records:  # production's pre-fix state: hash applied, no processed
+        state.record_key(f"applied:{_content_hash(record)}", "2026-10-23T00:00:00")
+
+    report = _run_apply(ctx)
+
+    assert state.is_processed("bddvid00003")
+    assert report["applied_chunks"] == 0
