@@ -111,8 +111,11 @@ def _date_key(result: SearchResult) -> str:
 
     Collapsing every undated date to "" is what lets the undated group keep its
     episode ordering through the date pass — otherwise a whitespace-only date
-    ("   ") would sort above "" and scramble the dateless tail."""
-    return "" if _is_undated(result) else (result.date or "")
+    ("   ") would sort above "" and scramble the dateless tail. The str()
+    coercion keeps the demote-not-raise promise honest: a poisoned payload can
+    carry a non-string date, and list.sort would TypeError across mixed types
+    (surfacing as a 500 on the read path otherwise)."""
+    return "" if _is_undated(result) else str(result.date or "")
 
 
 def apply_sort(

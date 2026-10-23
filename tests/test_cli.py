@@ -139,7 +139,11 @@ def test_stats_backfill_accepts_from_tabs_flag():
     assert args.from_tabs is True
 
 
-def test_from_tabs_runs_the_tab_pass_before_the_classic_pass(monkeypatch, capsys):
+def test_from_tabs_runs_the_tab_pass_before_the_classic_pass(
+    tmp_path, monkeypatch, capsys
+):
+    # lock_path injected like update/apply/backfill tests: the real
+    # data/stats-backfill.lock may be held by a live stats-backfill run
     import mc.ingest.stats_backfill as sb_mod
     from mc.cli import _cmd_stats_backfill, build_parser
 
@@ -156,13 +160,13 @@ def test_from_tabs_runs_the_tab_pass_before_the_classic_pass(monkeypatch, capsys
     )
     args = build_parser().parse_args(["stats-backfill", "--from-tabs", "--no-index"])
 
-    assert _cmd_stats_backfill(args) == 0
+    assert _cmd_stats_backfill(args, lock_path=tmp_path / "sb.lock") == 0
     assert calls == ["tabs", "classic"]
     out = capsys.readouterr().out
     assert out.index("TABS") < out.index("CLASSIC")
 
 
-def test_stats_backfill_refuses_to_overlap_with_a_held_lock(monkeypatch, capsys):
+def test_stats_backfill_refuses_to_overlap_with_a_held_lock(tmp_path, monkeypatch, capsys):
     from mc.cli import _cmd_stats_backfill, build_parser
     from mc.ingest.lock import AlreadyRunning
 
@@ -172,5 +176,5 @@ def test_stats_backfill_refuses_to_overlap_with_a_held_lock(monkeypatch, capsys)
     monkeypatch.setattr("mc.ingest.lock.RunLock.acquire", held)
     args = build_parser().parse_args(["stats-backfill"])
 
-    assert _cmd_stats_backfill(args) == 1
+    assert _cmd_stats_backfill(args, lock_path=tmp_path / "sb.lock") == 1
     assert "overlap" in capsys.readouterr().out.lower()

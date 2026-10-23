@@ -8,6 +8,7 @@ permutations with `random.Random(42)` (hypothesis is not installed).
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 
 import pytest
 
@@ -433,3 +434,17 @@ def test_apply_sort_empty_list():
     assert apply_sort([], "recent") == []
     assert apply_sort([], "oldest") == []
     assert apply_sort([], "relevance") == []
+
+
+def test_sort_survives_a_non_string_date_payload():
+    """Regression (code review): a poisoned index can carry a non-string date.
+    The date pass must coerce to str — demote-not-raise — never let list.sort
+    raise TypeError out of the routes as a 500 (failure-isolation invariant)."""
+    poisoned = replace(_result("a", 2.0, literal=True), date=20241020)
+    results = [poisoned, replace(_result("b", 1.0, literal=True), date="2026-01-01")]
+
+    for mode in ("recent", "oldest"):
+        out = apply_sort(results, mode)
+        assert len(out) == 2  # must not raise; count never changes
+        # the poisoned value sorts as its string self, it does not vanish
+        assert {r.video_id for r in out} == {"a", "b"}

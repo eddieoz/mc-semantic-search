@@ -39,7 +39,9 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     return run_apply()
 
 
-def _cmd_stats_backfill(args: argparse.Namespace) -> int:
+def _cmd_stats_backfill(
+    args: argparse.Namespace, lock_path: Path | None = None
+) -> int:
     from qdrant_client import QdrantClient
 
     from mc.config import DATA_DIR, QDRANT_URL
@@ -49,8 +51,10 @@ def _cmd_stats_backfill(args: argparse.Namespace) -> int:
 
     # The tab hydration pass (--from-tabs) is the longest job in the repo
     # (hours), and even the offline pass rewrites the same state DB — one
-    # holder at a time, cron guard convention, like `mc update`.
-    lock = RunLock(DATA_DIR / "stats-backfill.lock")
+    # holder at a time, cron guard convention, like `mc update`. lock_path is
+    # injectable like update/apply/backfill's — tests must not contend with a
+    # live operator run holding the real lock.
+    lock = RunLock(lock_path or DATA_DIR / "stats-backfill.lock")
     try:
         lock.acquire()
     except AlreadyRunning:
