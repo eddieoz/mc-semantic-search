@@ -14,7 +14,7 @@ import pytest
 from mc import config
 from mc.search.engine import SearchResult
 from mc.search.query import normalize, parse_query
-from mc.search.ranking import apply_boost
+from mc.search.ranking import apply_boost, apply_sort
 
 PHRASE = "bitcoin é bolha"
 PHRASE_NORM = normalize(PHRASE)  # "bitcoin e bolha" (diacritic-folded)

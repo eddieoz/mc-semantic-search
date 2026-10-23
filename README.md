@@ -2,7 +2,7 @@
 
 Semantic search over the *Morning Crypto* transcript archive. Replaces the
 SearXNG + SQLite FTS5 keyword pipeline with a Qdrant-backed hybrid
-(dense + sparse) search behind a FastAPI + htmx UI, deployed on sats4.life.
+(dense + sparse) search behind a FastAPI + htmx UI.
 Portuguese-first: users reach the **exact moment** an idea was said, even
 when their wording paraphrases the transcript.
 
@@ -34,7 +34,7 @@ when their wording paraphrases the transcript.
 - [Operations](#operations)
 - [Security](#security)
 - [Testing](#testing)
-- [Deployment (sats4.life)](#deployment-sats4life)
+- [Deployment](#deployment)
 - [Troubleshooting](#troubleshooting)
 - [Further docs](#further-docs)
 
@@ -422,7 +422,7 @@ local qdrant container from `make up`). Keep the container's `nofile`
 ulimit at the compose-configured 65536 or RocksDB returns
 `Too many open files` under load.
 
-## Deployment (sats4.life)
+## Deployment
 
 Full step-by-step: [docs/tasks/deploy-runbook.md](docs/tasks/deploy-runbook.md).
 Summary:
@@ -464,7 +464,7 @@ owned by uid 1000 to match the container's non-root user.
 | `docs/tasks/mc-semantic-search-epic.md` | Full story of the epic |
 | `crontab.example` | Mode A crontab (update, snapshot, apply sanity, notify hook) |
 | `docs/tasks/mode-b-runbook.md` | Mode B fallback: local scrape + push, failover table |
-| `docs/tasks/deploy-runbook.md` | sats4.life deployment, staging route, eval + cutover + rollback |
+| `docs/tasks/deploy-runbook.md` | deployment, staging route, eval + cutover + rollback |
 | `docs/tasks/cookies.md` | Cookie export/rotation + stale-cookie detection |
 | `docs/tasks/backup-restore.md` | Qdrant snapshots: create/restore drill |
 | `docs/tasks/eval-report.md` | Sparse-only vs hybrid MRR on known quotes (cutover evidence) |

@@ -10,8 +10,7 @@ that regressions quietly break.
 
 Semantic search over the *Morning Crypto* YouTube transcript
 archive. It replaces an old SearXNG + SQLite FTS5 keyword pipeline with a
-Qdrant-backed **hybrid** (dense + sparse) search behind a FastAPI + htmx UI,
-deployed on `sats4.life`. Portuguese-first: a user reaches the **exact moment**
+Qdrant-backed **hybrid** (dense + sparse) search behind a FastAPI + htmx UI. Portuguese-first: a user reaches the **exact moment**
 (`&t=` deep link, embedded `youtube-nocookie` player) an idea was said, even
 when their wording paraphrases the transcript.
 
