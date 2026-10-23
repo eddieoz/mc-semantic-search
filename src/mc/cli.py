@@ -42,23 +42,52 @@ def _cmd_apply(args: argparse.Namespace) -> int:
 def _cmd_stats_backfill(args: argparse.Namespace) -> int:
     from qdrant_client import QdrantClient
 
-    from mc.config import QDRANT_URL
+    from mc.config import DATA_DIR, QDRANT_URL
+    from mc.ingest.lock import AlreadyRunning, RunLock
     from mc.ingest.stats_backfill import run_stats_backfill
     from mc.qdrant import client_kwargs
 
-    # Index repair is ON by default — that is the point of the command: it also
-    # fills the episode/date old points were indexed without, so the result
-    # cards show them. --no-index keeps the run from touching Qdrant at all.
-    client = None if args.no_index else QdrantClient(url=QDRANT_URL, **client_kwargs(timeout=60))
-    report = run_stats_backfill(
-        fetch_missing=args.fetch_missing,
-        limit=args.limit,
-        from_db=args.from_db,
-        client=client,
-    )
-    # summary() has no trailing newline; a plain print terminates the line so
-    # the next shell prompt doesn't run into the numbers.
-    print(report["summary"])
+    # The tab hydration pass (--from-tabs) is the longest job in the repo
+    # (hours), and even the offline pass rewrites the same state DB — one
+    # holder at a time, cron guard convention, like `mc update`.
+    lock = RunLock(DATA_DIR / "stats-backfill.lock")
+    try:
+        lock.acquire()
+    except AlreadyRunning:
+        print("stats-backfill: another run holds the lock — refusing to overlap")
+        return 1
+    try:
+        # Index repair is ON by default — that is the point of the command: it also
+        # fills the episode/date old points were indexed without, so the result
+        # cards show them. --no-index keeps the run from touching Qdrant at all.
+        client = (
+            None if args.no_index else QdrantClient(url=QDRANT_URL, **client_kwargs(timeout=60))
+        )
+        # Story 8.1: --from-tabs hydrates exact upload dates straight from the
+        # channel tabs (one yt-dlp pass per tab, hours) BEFORE the classic
+        # pass, which then mops rows/payloads up from the now-richer cache.
+        if args.from_tabs:
+            from mc.ingest.stats_backfill import run_tab_backfill
+
+            print(run_tab_backfill(client=client)["summary"])
+        report = run_stats_backfill(
+            fetch_missing=args.fetch_missing,
+            limit=args.limit,
+            from_db=args.from_db,
+            client=client,
+        )
+        # summary() has no trailing newline; a plain print terminates the line so
+        # the next shell prompt doesn't run into the numbers.
+        print(report["summary"])
+        # Story 7.3: the temporal sort modes need trustworthy payload dates, so the
+        # same command also audits + backfills null-date payloads (cache → row →
+        # set_payload). Needs the index client; --no-index keeps the run off Qdrant.
+        if client is not None:
+            from mc.ingest.date_backfill import run_date_backfill
+
+            print(run_date_backfill(client=client)["summary"])
+    finally:
+        lock.release()
     return 0
 
 
@@ -139,6 +168,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-derive every episode from the chunked titles in a legacy "
         "mc_transcripts.db (authoritative and offline; junk episodes are "
         "cleared, rows/caches/payloads corrected)",
+    )
+    p.add_argument(
+        "--from-tabs",
+        action="store_true",
+        help="hydrate exact upload dates straight from the channel tabs: one "
+        "uncapped yt-dlp full-extraction pass per /videos /streams /shorts "
+        "tab (hours; randomized 3-8 s pacing; resumable/idempotent), then "
+        "the classic pass aligns rows/payloads from the richer cache",
     )
     p.add_argument("--limit", type=int, default=None, help="cap videos considered this run")
     p.set_defaults(func=_cmd_stats_backfill)

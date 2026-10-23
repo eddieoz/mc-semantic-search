@@ -206,7 +206,7 @@ channel automatically covers all three tabs (no code change).
 | `mc update [--dry-run]` | One daily pass: discover→download→chunk→embed→upsert→stage. `--dry-run` verifies cookies only |
 | `mc push` | rsync the staged increment to `$MC_PUSH_DEST` (Mode B) |
 | `mc apply` | Embed + upsert queued increments (Mode B server); validates + quarantines failures; no-op when empty |
-| `mc stats-backfill [--fetch-missing] [--no-index] [--from-db PATH] [--limit N]` | Repair `video_stats` + old Qdrant payloads; `--no-index` skips Qdrant, `--from-db` re-derives episodes offline |
+| `mc stats-backfill [--fetch-missing] [--no-index] [--from-db PATH] [--from-tabs] [--limit N]` | Repair `video_stats` + old Qdrant payloads; `--no-index` skips Qdrant, `--from-db` re-derives episodes offline, `--from-tabs` hydrates exact upload dates from the channel tabs (hours, randomized 3-8s pacing, residential IP) |
 | `mc reindex --model ID` | Rebuild every chunk into a new collection and swap the alias atomically (old kept for rollback) |
 | `mc eval --suite PATH [--limit 50] [--out FILE]` | Sparse-only vs hybrid MRR; exits non-zero if hybrid regresses (cutover gate) |
 | `mc serve` | Run the search API on `$API_PORT` |

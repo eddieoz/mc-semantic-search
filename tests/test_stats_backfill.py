@@ -809,3 +809,314 @@ def test_from_db_video_missing_from_titles_keeps_normal_flow(tmp_path):
     stats = state.archive_stats()
     assert stats["last_episode"] == 999
     assert report["episodes_repaired"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Story 8.1 — `--from-tabs`: one yt-dlp full-extraction pass per channel tab
+# prints id/upload_date/title/duration as TSV; each parsed line merges into
+# the meta cache (never regressing known fields), dates the stats row and
+# repairs the Qdrant payload where it is still empty. Exact dates only:
+# `upload_date` is not available in flat listings and the approximate variant
+# degrades to year-granularity on old entries (decision D13).
+# ---------------------------------------------------------------------------
+
+from subprocess import CompletedProcess  # noqa: E402
+
+from mc.ingest.stats_backfill import run_tab_backfill  # noqa: E402
+
+_TAB_TEMPLATE = "%(id)s\t%(upload_date)s\t%(title)s\t%(duration)s"
+
+
+class _Recorder:
+    """Fake yt-dlp runner: maps tab URL → (returncode, stdout, stderr)."""
+
+    def __init__(self, responses: dict[str, tuple[int, str, str]]):
+        self.responses = responses
+        self.argvs: list[list[str]] = []
+
+    def __call__(self, argv):
+        self.argvs.append(argv)
+        url = argv[-1]
+        code, out, err = self.responses.get(url, (0, "", ""))
+        return CompletedProcess(argv, code, stdout=out, stderr=err)
+
+
+def _tsv(video_id: str, date: str, title: str, duration: str) -> str:
+    return f"{video_id}\t{date}\t{title}\t{duration}"
+
+
+def test_tab_pass_runs_full_extraction_per_tab(tmp_path):
+    """One uncapped yt-dlp pass per tab — full extraction (no --flat-playlist,
+    that is what makes upload_date available) with the reference script's
+    proven randomized pacing."""
+    rec = _Recorder({})
+    state, cache_dir, _ = _ctx(tmp_path)
+
+    run_tab_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        channels=("https://youtube.com/@chan",),
+        runner=rec,
+        sleeper=lambda _: None,
+    )
+
+    urls = [argv[-1] for argv in rec.argvs]
+    assert urls == [
+        "https://youtube.com/@chan/videos",
+        "https://youtube.com/@chan/streams",
+        "https://youtube.com/@chan/shorts",
+    ]
+    for argv in rec.argvs:
+        assert "--flat-playlist" not in argv
+        assert "--playlist-end" not in argv  # the daily-discovery cap must not apply
+        print_idx = argv.index("--print")
+        assert argv[print_idx + 1] == _TAB_TEMPLATE
+        assert "--sleep-requests" in argv and "--sleep-interval" in argv
+        assert argv[argv.index("--sleep-interval") + 1] == "3"
+        assert argv[argv.index("--max-sleep-interval") + 1] == "8"
+
+
+def test_tab_pass_passes_cookies_only_when_the_file_exists(tmp_path, monkeypatch):
+    rec = _Recorder({})
+    state, cache_dir, _ = _ctx(tmp_path)
+
+    monkeypatch.setattr("mc.config.COOKIES_PATH", str(tmp_path / "cookies.txt"))
+    run_tab_backfill(
+        state=state, cache_dir=cache_dir, channels=("https://youtube.com/@c",),
+        runner=rec, sleeper=lambda _: None,
+    )
+    assert all("--cookies" not in argv for argv in rec.argvs)
+
+    (tmp_path / "cookies.txt").write_text("# netscape\n", encoding="utf-8")
+    run_tab_backfill(
+        state=state, cache_dir=cache_dir, channels=("https://youtube.com/@c",),
+        runner=rec, sleeper=lambda _: None,
+    )
+    assert rec.argvs[-1][rec.argvs[-1].index("--cookies") + 1] == str(tmp_path / "cookies.txt")
+
+
+def test_tab_pass_parses_tsv_and_dates_the_rows(tmp_path):
+    state, cache_dir, _ = _ctx(tmp_path)
+    rec = _Recorder({
+        "https://youtube.com/@chan/videos": (
+            0,
+            _tsv("abc747video", "20240315", "[ IRL ][ ep 747 ] x", "5400.0") + "\n",
+            "",
+        ),
+    })
+
+    report = run_tab_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        channels=("https://youtube.com/@chan",),
+        runner=rec,
+        sleeper=lambda _: None,
+    )
+
+    facts = state.video_facts("abc747video")
+    assert facts["date"] == "2024-03-15"
+    assert facts["episode"] == 747
+    assert facts["duration"] == 5400
+    assert report["videos_seen"] == 1
+    assert report["videos_dated"] == 1
+    assert report["tabs_listed"] == 3
+
+
+def test_tab_pass_writes_the_cache_without_regressing_known_fields(tmp_path):
+    state, cache_dir, _ = _ctx(tmp_path)
+    _write_cache(cache_dir, "abc747video", {"date": "2020-01-01", "episode": "700"})
+    rec = _Recorder({
+        "https://youtube.com/@chan/videos": (
+            0,
+            _tsv("abc747video", "20240315", "[ IRL ][ ep 747 ] x", "5400.0") + "\n",
+            "",
+        ),
+    })
+
+    run_tab_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        channels=("https://youtube.com/@chan",),
+        runner=rec,
+        sleeper=lambda _: None,
+    )
+
+    import json
+
+    stored = json.loads((cache_dir / "abc747video.json").read_text(encoding="utf-8"))
+    assert stored["date"] == "2020-01-01"  # known cache fields are never regressed
+    assert stored["duration"] == 5400  # missing ones are gained
+    assert state.video_facts("abc747video")["date"] == "2020-01-01"
+
+
+def test_tab_pass_repairs_empty_index_payloads(tmp_path):
+    state, cache_dir, _ = _ctx(tmp_path)
+    rec = _Recorder({
+        "https://youtube.com/@chan/videos": (
+            0,
+            _tsv("abc747video", "20240315", "[ IRL ][ ep 747 ] x", "5400.0") + "\n",
+            "",
+        ),
+    })
+    spy = _SpyClient()
+
+    report = run_tab_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        channels=("https://youtube.com/@chan",),
+        runner=rec,
+        sleeper=lambda _: None,
+        client=spy,
+        collection="c",
+    )
+
+    written = {k: v for call in spy.calls for k, v in call["payload"].items()}
+    assert written == {"date": "2024-03-15", "episode": "747", "duration": 5400}
+    for call in spy.calls:
+        (field,) = call["payload"].keys()
+        assert _targets_empty_field(call["points"], field)
+    assert report["index_updated"] == 1
+
+
+def test_tab_pass_skips_invalid_video_ids(tmp_path):
+    """A degraded no-cookie listing can surface non-video ids — never store them."""
+    state, cache_dir, _ = _ctx(tmp_path)
+    rec = _Recorder({
+        "https://youtube.com/@chan/videos": (
+            0,
+            _tsv("UCx24charchannelid24", "20240315", "t", "1") + "\n",
+            "",
+        ),
+    })
+
+    report = run_tab_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        channels=("https://youtube.com/@chan",),
+        runner=rec,
+        sleeper=lambda _: None,
+    )
+
+    assert state.video_facts("UCx24charchannelid24") == {
+        "duration": None,
+        "episode": None,
+        "date": None,
+    }
+    assert report["videos_seen"] == 0
+
+
+def test_tab_pass_handles_na_fields(tmp_path):
+    """yt-dlp prints NA for fields an entry lacks — NA is absence, not data."""
+    state, cache_dir, _ = _ctx(tmp_path)
+    rec = _Recorder({
+        "https://youtube.com/@chan/shorts": (
+            0,
+            _tsv("abcshortvid", "NA", "Some Short", "NA") + "\n",
+            "",
+        ),
+    })
+    spy = _SpyClient()
+
+    report = run_tab_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        channels=("https://youtube.com/@chan",),
+        runner=rec,
+        sleeper=lambda _: None,
+        client=spy,
+    )
+
+    assert state.video_facts("abcshortvid")["date"] is None
+    assert report["videos_dated"] == 0
+    assert spy.calls == []  # nothing resolved → nothing offered to the index
+
+
+def test_tab_pass_tolerates_an_absent_tab(tmp_path):
+    state, cache_dir, _ = _ctx(tmp_path)
+    rec = _Recorder({
+        "https://youtube.com/@chan/streams": (
+            1,
+            "",
+            "ERROR: This channel does not have a streams tab",
+        ),
+    })
+
+    report = run_tab_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        channels=("https://youtube.com/@chan",),
+        runner=rec,
+        sleeper=lambda _: None,
+    )
+
+    assert report["tabs_skipped"] == 1
+    assert report["tabs_failed"] == 0
+    assert report["tabs_listed"] == 2  # videos + shorts still listed
+
+
+def test_tab_pass_continues_after_a_failed_tab(tmp_path):
+    """A bot gate or network error on one tab must not kill the run."""
+    state, cache_dir, _ = _ctx(tmp_path)
+    rec = _Recorder({
+        "https://youtube.com/@chan/videos": (1, "", "Sign in to confirm you're not a bot"),
+        "https://youtube.com/@chan/streams": (
+            0,
+            _tsv("abc747video", "20240315", "[ IRL ][ ep 747 ] x", "5400.0") + "\n",
+            "",
+        ),
+    })
+
+    report = run_tab_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        channels=("https://youtube.com/@chan",),
+        runner=rec,
+        sleeper=lambda _: None,
+    )
+
+    assert report["tabs_failed"] == 1
+    assert state.video_facts("abc747video")["date"] == "2024-03-15"
+    assert "1 tabs failed" in report["summary"]
+
+
+def test_tab_pass_sleeps_between_tabs(tmp_path):
+    state, cache_dir, _ = _ctx(tmp_path)
+    sleeps: list[float] = []
+    run_tab_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        channels=("https://youtube.com/@chan",),
+        runner=_Recorder({}),
+        sleeper=sleeps.append,
+    )
+    assert len(sleeps) >= 2  # between the 3 tabs of one channel
+
+
+def test_tab_pass_overwrites_a_poisoned_cache_entry(tmp_path):
+    """A placeholder-title poison (episode digits inside the video id, no
+    duration) is not knowledge — the tab pass heals it instead of preserving
+    it, exactly like the classic fetch path does."""
+    state, cache_dir, _ = _ctx(tmp_path)
+    _write_cache(cache_dir, "ab301415cde", {"episode": "301415"})  # no duration → poison
+    rec = _Recorder({
+        "https://youtube.com/@chan/videos": (
+            0,
+            _tsv("ab301415cde", "20240315", "[ IRL ][ ep 747 ] x", "5400.0") + "\n",
+            "",
+        ),
+    })
+
+    run_tab_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        channels=("https://youtube.com/@chan",),
+        runner=rec,
+        sleeper=lambda _: None,
+    )
+
+    import json
+
+    stored = json.loads((cache_dir / "ab301415cde.json").read_text(encoding="utf-8"))
+    assert stored["episode"] == "747"
+    assert stored["duration"] == 5400
+    assert state.video_facts("ab301415cde")["episode"] == 747

@@ -122,3 +122,55 @@ def test_stats_backfill_from_db_threads_the_argument(tmp_path):
     assert "747 episodes re-derived" not in result.stdout  # only 1 row
     assert "1 episodes re-derived" in result.stdout
     assert StateStore(state_dir / "ingest.db").video_facts("abc747junk1")["episode"] == 747
+
+
+# ---------------------------------------------------------------------------
+# Story 8.2 — `stats-backfill --from-tabs`: the tab-driven date hydration pass
+# runs BEFORE the classic pass (which mops rows/payloads up from the now-richer
+# cache), and the whole command holds the flock RunLock so a cron overlap can
+# never run two multi-hour hydration passes against the same index.
+# ---------------------------------------------------------------------------
+
+
+def test_stats_backfill_accepts_from_tabs_flag():
+    from mc.cli import build_parser
+
+    args = build_parser().parse_args(["stats-backfill", "--from-tabs"])
+    assert args.from_tabs is True
+
+
+def test_from_tabs_runs_the_tab_pass_before_the_classic_pass(monkeypatch, capsys):
+    import mc.ingest.stats_backfill as sb_mod
+    from mc.cli import _cmd_stats_backfill, build_parser
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        sb_mod,
+        "run_tab_backfill",
+        lambda **kw: calls.append("tabs") or {"summary": "stats-backfill tabs: TABS"},
+    )
+    monkeypatch.setattr(
+        sb_mod,
+        "run_stats_backfill",
+        lambda **kw: calls.append("classic") or {"summary": "stats-backfill: CLASSIC"},
+    )
+    args = build_parser().parse_args(["stats-backfill", "--from-tabs", "--no-index"])
+
+    assert _cmd_stats_backfill(args) == 0
+    assert calls == ["tabs", "classic"]
+    out = capsys.readouterr().out
+    assert out.index("TABS") < out.index("CLASSIC")
+
+
+def test_stats_backfill_refuses_to_overlap_with_a_held_lock(monkeypatch, capsys):
+    from mc.cli import _cmd_stats_backfill, build_parser
+    from mc.ingest.lock import AlreadyRunning
+
+    def held(self):
+        raise AlreadyRunning("another run holds the lock")
+
+    monkeypatch.setattr("mc.ingest.lock.RunLock.acquire", held)
+    args = build_parser().parse_args(["stats-backfill"])
+
+    assert _cmd_stats_backfill(args) == 1
+    assert "overlap" in capsys.readouterr().out.lower()

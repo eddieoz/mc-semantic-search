@@ -256,6 +256,7 @@ mc update --dry-run
 | `mc update [--dry-run]` | One daily pass: discover → download → chunk → embed → upsert → stage increment. `--dry-run` verifies cookies only |
 | `mc push` | rsync the staged increment to `$MC_PUSH_DEST` (Mode B) |
 | `mc apply` | Embed + upsert queued increments (Mode B server side); validates URLs/text/size, quarantines failures; no-op when the queue is empty |
+| `mc stats-backfill [--fetch-missing] [--no-index] [--from-db PATH] [--from-tabs] [--limit N]` | Repair `video_stats` + old Qdrant payloads; `--from-tabs` hydrates exact upload dates from the channel tabs (hours, residential IP — run detached) |
 | `mc reindex --model ID` | Rebuild every chunk into a new collection (re-embeds) and swap the alias in one atomic update |
 | `mc eval --suite PATH [--limit 50] [--out FILE]` | Sparse-only vs hybrid MRR on known quotes; exits non-zero if hybrid regresses (cutover gate) |
 | `mc serve` | Run the search API on `$API_PORT` |
@@ -299,6 +300,15 @@ Every `render=json` response is also self-describing.
 `render` is case-insensitive and only the literal value `json` switches the
 format; anything else (or its absence) renders HTML as before.
 
+`sort` orders the returned set — `relevance` (default, unchanged), `recent`
+(date descending) or `oldest` (date ascending); undated results sink to the
+bottom in both date modes. It is post-retrieval only: the same ≤ 50 relevance
+candidates are reordered, no extra query is run. The web UI exposes the same
+three-way control next to the results; the chosen mode rides in the URL
+(`?query=…&sort=…`) so a sort survives a new query and is shareable. Under
+`recent`/`oldest`, per-result `score` stays a per-result relevance and is
+**not** monotonic with position — don't re-rank by it.
+
 Constraints: `query` 1–512 chars, `limit` default 10 / max 50. The engine
 clamps both again internally, so direct callers cannot bypass the caps.
 
@@ -308,6 +318,7 @@ clamps both again internally, so direct callers cannot bypass the caps.
 {
   "query": "bitcoin halving",
   "took_ms": 42.1,
+  "sort": "relevance",
   "freshness": {"last_update": "2026-10-10T06:20:00+00:00"},
   "results": [
     {
@@ -468,3 +479,4 @@ owned by uid 1000 to match the container's non-root user.
 | `docs/tasks/cookies.md` | Cookie export/rotation + stale-cookie detection |
 | `docs/tasks/backup-restore.md` | Qdrant snapshots: create/restore drill |
 | `docs/tasks/eval-report.md` | Sparse-only vs hybrid MRR on known quotes (cutover evidence) |
+| `docs/tasks/results-sorting-epic.md` | Results sorting: relevance / most recent / oldest (web UI control + `/search` & `render=json` knob) |
