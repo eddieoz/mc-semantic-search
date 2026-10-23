@@ -1,0 +1,12 @@
+# Morning Crypto — channels ingested by `mc update` (Story 3.1).
+#
+# discover.load_channels() reads THIS file first, then falls back to the
+# MC_CHANNELS env var. Each channel is listed across its /videos, /streams
+# and /shorts tabs and the video ids are unioned (see mc/ingest/discover.py) —
+# Morning Crypto episodes are live streams that only appear under /streams.
+#
+# These are public channel URLs (not credentials), so this file is committed.
+channels:
+  - "https://www.youtube.com/channel/UCN_h_1w3ofp1qMgrwcnaykw"
+  - "https://www.youtube.com/channel/UC0JADezsbV-CWlDscvVOT3g"
+  - "https://www.youtube.com/channel/UCzwLEvNi0__N9BHbgTqJKeQ"

@@ -204,7 +204,7 @@ of truth; fingerprinted into the collection).
 | `FRESHNESS_MAX_HOURS` | `72` | `/health` reports `stale` when the last successful ingest is older than this |
 | `SEARCH_QUOTE_BOOST` | `0.5` | Score demotion factor for non-literal matches |
 | `SEARCH_CACHE_SIZE` | `128` | Query-embedding LRU size |
-| `MC_CHANNELS` | `` | Comma-separated YouTube channel URLs to ingest |
+| `MC_CHANNELS` | *(unset; see `config.yaml`)* | Comma-separated YouTube channel URLs to ingest; `config.yaml` lists them, this env overrides |
 | `MC_COOKIES_PATH` | `<repo>/cookies.txt` | YouTube cookies file — **live credentials**: keep mode 0600, never commit |
 | `MC_DATA_DIR` | `<repo>/data` | Root for metadata cache, queue, qdrant storage |
 | `MC_STATE_DIR` | `<repo>/state` | SQLite ingest bookkeeping |
@@ -217,6 +217,22 @@ Constants (not env-tunable): dense model `intfloat/multilingual-e5-small`
 (384-dim), sparse model `Qdrant/bm25` (Portuguese), collection
 `mc-transcripts-v1` (searched by name; `mc reindex` swaps the alias
 `mc-transcripts-v1-alias` to a freshly built collection).
+
+### Channels (`config.yaml`)
+
+The channels `mc update` ingests live in `config.yaml` (committed; public
+URLs, not credentials). `discover.load_channels()` reads it first, then falls
+back to the `MC_CHANNELS` env var. Each channel is listed across its
+`/videos`, `/streams` and `/shorts` tabs and the video ids are unioned —
+Morning Crypto episodes are live streams that only appear under `/streams`:
+
+```yaml
+channels:
+  - "https://www.youtube.com/channel/UC…"
+```
+
+The channel list is configuration, never hardcoded in code (enforced by
+`tests/test_discover.py::test_channels_come_from_config_not_hardcoded`).
 
 ### Cookies (ingestion credentials)
 
@@ -300,7 +316,7 @@ clamps both again internally, so direct callers cannot bypass the caps.
       "start_seconds": 734,
       "date": "2024-04-19",
       "episode": "EP 123",
-      "channel": "",
+      "channel": "Morning Crypto",
       "snippet": "…e é por isso que o <mark>halving</mark> muda tudo…",
       "score": 0.83
     }

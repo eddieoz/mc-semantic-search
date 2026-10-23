@@ -48,6 +48,8 @@ CHANNELS = tuple(
     for line in (
         os.environ.get(
             "MC_CHANNELS",
+            # No hardcoded default — the channels to ingest live in config.yaml
+            # (read first by discover.load_channels) or the MC_CHANNELS env.
             "",
         ).split(",")
     )
