@@ -59,9 +59,11 @@ def test_render_json_with_query_matches_search_contract(client):
         "took_ms",
         "freshness",
         "archive_status",
+        "sort",
         "results",
     }
     assert body["query"] == "bitcoin"
+    assert body["sort"] == "relevance"  # effective mode echoed, always present
     assert isinstance(body["took_ms"], int | float)
     assert "last_update" in body["freshness"]
     assert len(body["results"]) == 1
@@ -85,6 +87,7 @@ def test_render_json_without_query_returns_manual(client):
     body = response.json()
     assert body["query"] == ""
     assert body["results"] == []
+    assert body["sort"] == "relevance"  # manual branch still echoes the effective mode
     assert body["agent"]["role"] == "bibliotecária do acervo Morning Crypto"
 
 
@@ -137,6 +140,26 @@ def test_llms_txt_sections_are_canonical_link_lists(client):
 def test_llms_txt_honors_proxy_scheme(client):
     response = client.get("/llms.txt", headers={"x-forwarded-proto": "https"})
     assert "https://testserver/llms.txt" in response.text
+
+
+def test_llms_txt_documents_sort_modes(client):
+    """Story 7.7 — the /search sort knob and its date-order semantics are in
+    the manual: the three modes, the relevance default, and the undated-last
+    rule that keeps dateless episodes from masquerading as the newest."""
+    text = client.get("/llms.txt").text
+    assert "sort" in text
+    assert "relevance" in text and "recent" in text and "oldest" in text
+    assert "sem data" in text  # undated payloads sort last under date modes
+
+
+def test_agent_card_documents_sort_and_score_semantics(client):
+    """The render=json agent block names the sort param and records that,
+    under date modes, per-result score stays a per-result relevance and is
+    non-monotonic with position (so an agent never re-ranks by score)."""
+    agent = client.get("/", params={"query": "x", "render": "json"}).json()["agent"]
+    assert "sort" in agent["params"]
+    assert "recent" in agent["params"]["sort"] and "oldest" in agent["params"]["sort"]
+    assert "recent" in agent["result_fields"]["score"]
 
 
 @pytest.fixture

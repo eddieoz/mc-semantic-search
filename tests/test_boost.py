@@ -276,3 +276,160 @@ def test_property_boost_preserves_count_and_permutes_scores():
             expected = orig.score if _is_literal(orig) else orig.score * FACTOR
             assert out.score == pytest.approx(expected)
             assert _is_literal(out) == _is_literal(orig)  # text untouched
+
+
+# --- Story 7.1 — apply_sort(): relevance / recent / oldest --------------------
+# Post-retrieval temporal reorder of the already-ranked set. Relevance is the
+# identity (boost order preserved); recent/oldest reorder by payload date with
+# undated sinking last and episode_int as the numeric tie-break. Count NEVER
+# changes — sort is a pure permutation like the boost above.
+
+
+def _s(video_id, *, date, episode, score, text="transcript text"):
+    return SearchResult(
+        video_id=video_id,
+        text=text,
+        url=f"https://www.youtube.com/watch?v={video_id}",
+        start_seconds=0,
+        date=date,
+        episode=episode,
+        channel="morning crypto",
+        score=score,
+    )
+
+
+def test_apply_sort_relevance_is_identity_and_returns_new_list():
+    results = [
+        _s("a", date="2026-01-01", episode="1", score=0.9),
+        _s("b", date="2026-02-01", episode="2", score=0.5),
+        _s("c", date="2026-03-01", episode="3", score=0.1),
+    ]
+    out = apply_sort(results, "relevance")
+    assert out is not results  # a new list, input untouched
+    assert [r.video_id for r in out] == ["a", "b", "c"]
+
+
+def test_apply_sort_default_mode_is_relevance():
+    results = [_s("a", date=None, episode=None, score=1.0)]
+    assert [r.video_id for r in apply_sort(results)] == ["a"]
+
+
+def test_apply_sort_does_not_mutate_input():
+    results = [
+        _s("a", date="2026-01-01", episode="1", score=0.5),
+        _s("b", date="2026-05-01", episode="2", score=0.9),
+    ]
+    snapshot = list(results)
+    apply_sort(results, "recent")
+    assert results == snapshot
+
+
+def test_apply_sort_relevance_ignores_dates():
+    """relevance mode never reorders by date — an input in non-date order stays
+    put (date-desc would flip it to newest-first; relevance does not)."""
+    results = [
+        _s("old", date="2021-01-01", episode="1", score=0.9),
+        _s("new", date="2026-10-20", episode="999", score=0.3),
+    ]
+    assert [r.video_id for r in apply_sort(results, "relevance")] == ["old", "new"]
+
+
+def test_apply_sort_relevance_matches_boost_order():
+    """The DoD regression: apply_sort(relevance) is the identity on the boost
+    output — feeding it apply_boost()'s result returns it unchanged."""
+    results = [
+        _s("a", date="2026-01-01", episode="1", score=0.5),
+        _s("b", date="2026-02-01", episode="2", score=2.0),
+        _s("c", date="2026-03-01", episode="3", score=1.0),
+    ]
+    boosted = apply_boost(results, PLAIN, factor=FACTOR)  # re-sorted by score desc
+    reordered = apply_sort(boosted, "relevance")
+    assert [r.video_id for r in reordered] == [r.video_id for r in boosted]
+    assert [r.video_id for r in boosted] == ["b", "c", "a"]  # score 2.0, 1.0, 0.5
+
+
+def test_apply_sort_recent_dates_descending():
+    results = [
+        _s("old", date="2021-03-01", episode="500", score=0.7),
+        _s("new", date="2026-10-20", episode="1000", score=0.5),
+        _s("mid", date="2024-06-15", episode="700", score=0.9),
+    ]
+    out = apply_sort(results, "recent")
+    assert [r.video_id for r in out] == ["new", "mid", "old"]
+
+
+def test_apply_sort_oldest_dates_ascending():
+    results = [
+        _s("old", date="2021-03-01", episode="500", score=0.7),
+        _s("new", date="2026-10-20", episode="1000", score=0.5),
+        _s("mid", date="2024-06-15", episode="700", score=0.9),
+    ]
+    out = apply_sort(results, "oldest")
+    assert [r.video_id for r in out] == ["old", "mid", "new"]
+
+
+def test_apply_sort_undated_sink_last_in_both_modes():
+    dated = _s("d", date="2026-10-20", episode="1000", score=0.5)
+    undated_hi = _s("u1", date=None, episode="2000", score=0.9)
+    undated_blank = _s("u2", date="   ", episode="1500", score=0.1)
+    # recent: dated first, then undated by episode desc (2000 before 1500)
+    assert [r.video_id for r in apply_sort([undated_hi, dated, undated_blank], "recent")] == [
+        "d",
+        "u1",
+        "u2",
+    ]
+    # oldest: dated first, then undated by episode asc (1500 before 2000)
+    assert [r.video_id for r in apply_sort([undated_hi, dated, undated_blank], "oldest")] == [
+        "d",
+        "u2",
+        "u1",
+    ]
+
+
+def test_apply_sort_episode_is_numeric_not_lexical():
+    """episode "1000" must beat "999" — the lexicographic trap ("999" > "1000")."""
+    thousand = _s("k", date="2026-10-20", episode="1000", score=0.1)
+    nineh = _s("n", date="2026-10-20", episode="999", score=0.9)
+    assert [r.video_id for r in apply_sort([nineh, thousand], "recent")] == ["k", "n"]
+
+
+def test_apply_sort_tie_same_date_higher_episode_then_score():
+    """Same date → higher episode first; equal episode → higher score first."""
+    a = _s("a", date="2026-10-20", episode="500", score=0.9)
+    b = _s("b", date="2026-10-20", episode="500", score=0.1)  # same ep, lower score
+    c = _s("c", date="2026-10-20", episode="499", score=0.99)  # lower ep
+    assert [r.video_id for r in apply_sort([b, c, a], "recent")] == ["a", "b", "c"]
+
+
+def test_apply_sort_tie_oldest_episode_ascending():
+    a = _s("a", date="2026-10-20", episode="500", score=0.9)
+    c = _s("c", date="2026-10-20", episode="499", score=0.99)
+    assert [r.video_id for r in apply_sort([a, c], "oldest")] == ["c", "a"]
+
+
+def test_apply_sort_poisoned_values_never_raise():
+    """Malformed date strings sort as strings; "" and None are undated. No crash."""
+    results = [
+        _s("slash", date="20/10/2026", episode="1", score=0.5),
+        _s("bad", date="2026-13-45", episode="2", score=0.6),
+        _s("blank", date="", episode="3", score=0.7),
+        _s("none", date=None, episode="4", score=0.8),
+    ]
+    for mode in ("recent", "oldest"):
+        out = apply_sort(results, mode)  # must not raise
+        assert len(out) == 4  # count preserved
+        assert {r.video_id for r in out[:2]} == {"slash", "bad"}  # dated first
+        assert {r.video_id for r in out[-2:]} == {"blank", "none"}  # undated last
+    # relevance keeps input order, poisoned values untouched
+    assert [r.video_id for r in apply_sort(results, "relevance")] == [
+        "slash",
+        "bad",
+        "blank",
+        "none",
+    ]
+
+
+def test_apply_sort_empty_list():
+    assert apply_sort([], "recent") == []
+    assert apply_sort([], "oldest") == []
+    assert apply_sort([], "relevance") == []

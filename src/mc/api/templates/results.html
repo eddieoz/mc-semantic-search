@@ -1,5 +1,31 @@
 {# htmx partial: the results ledger for the current query. #}
 {% if results %}
+{# the results toolbar: the scope signal (Story 7.4/7.5) on the left — how many,
+   and in what order — and the sort control on the right, the HuggingFace
+   "Sort: Trending" arrangement (decision D12). The control is a native
+   <select> inside a real GET form (the sorted screen stays reachable by URL
+   without JS); selecting an option reorders instantly via the htmx change
+   enhancement, so there is no submit button. It lives inside the swap region,
+   so it appears/disappears with the results. #}
+<div class="results-toolbar">
+  <p class="results-caption">{{ caption }}</p>
+  <form class="sortbar" action="/" method="get"
+        hx-get="/" hx-target="#resultados" hx-select="#resultados"
+        hx-push-url="true" hx-trigger="change">
+    <input type="hidden" name="query" value="{{ query }}">
+    <label class="visually-hidden" for="sort-mode">ordenar por:</label>
+    {# the caret host draws the amber chevron in pure CSS — CSP img-src has no
+       data:, so an inline SVG data URI here would be silently blocked #}
+    <span class="sortbar-caret"><select class="sortbar-select" id="sort-mode" name="sort">
+      <option value="relevance" {{ 'selected' if sort == 'relevance' }}>mais relevantes</option>
+      <option value="recent" {{ 'selected' if sort == 'recent' }}>mais recentes</option>
+      <option value="oldest" {{ 'selected' if sort == 'oldest' }}>mais antigos</option>
+    </select></span>
+    {# a sr-only confirmation so a screen reader hears the reorder instead of a
+       50-card aria-live dump (role=status is an implicit aria-live=polite) #}
+    <span class="visually-hidden" role="status">{% if sort == 'recent' %}resultados reordenados por mais recentes{% elif sort == 'oldest' %}resultados reordenados por mais antigos{% else %}resultados reordenados por mais relevantes{% endif %}</span>
+  </form>
+</div>
 <div class="ledger" aria-live="polite">
   {% for r in results %}{% include "result.html" %}{% endfor %}
 </div>

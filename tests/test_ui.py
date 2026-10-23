@@ -145,10 +145,13 @@ def ctx(tmp_path):
     )
     ctx["client_http"] = TestClient(ctx["app"])
     ctx["empty_collection"] = None
+    ctx["sort_collection"] = None  # set by the sort-ordering scenarios
     yield ctx
     client.delete_collection(collection)
     if ctx["empty_collection"]:
         client.delete_collection(ctx["empty_collection"])
+    if ctx["sort_collection"]:
+        client.delete_collection(ctx["sort_collection"])
 
 
 @given("I am on the search page")
@@ -279,6 +282,136 @@ def test_page_renders_without_javascript(ctx):
     assert 'action="/" method="get"' in html
 
 
+# --- Story 7.4 — HTML doors thread `sort` (routes, context, ordering) ----------
+# The seed (see _seed) has video000001 dated 2026-10-09 and video000002 dated
+# 2026-10-08, both matching QUERY_WORD, so a date sort has a deterministic order.
+
+
+def test_sort_recent_orders_newest_first(ctx):
+    html = ctx["client_http"].get(
+        "/", params={"query": QUERY_WORD, "sort": "recent"}
+    ).text
+    assert html.index("2026-10-09") < html.index("2026-10-08")
+
+
+def test_sort_oldest_orders_oldest_first(ctx):
+    html = ctx["client_http"].get(
+        "/", params={"query": QUERY_WORD, "sort": "oldest"}
+    ).text
+    assert html.index("2026-10-08") < html.index("2026-10-09")
+
+
+def test_invalid_sort_coerces_to_relevance(ctx):
+    """A bad sort on the human door is coerced (200, no reorder), never a 422."""
+    resp = ctx["client_http"].get("/", params={"query": QUERY_WORD, "sort": "weird"})
+    assert resp.status_code == 200
+    assert "ordenado por" not in resp.text  # relevance has no ordering caption
+
+
+def test_partial_results_honors_sort(ctx):
+    """The /results partial honors the mode too (htmx swap target)."""
+    html = ctx["client_http"].get(
+        "/results", params={"query": QUERY_WORD, "sort": "recent"}
+    ).text
+    assert "<html" not in html  # it is the partial, not the full page
+    assert html.index("2026-10-09") < html.index("2026-10-08")
+
+
+def test_caption_reflects_mode(ctx):
+    recent = ctx["client_http"].get(
+        "/", params={"query": QUERY_WORD, "sort": "recent"}
+    ).text
+    assert "2 resultados · ordenado por mais recentes" in recent
+    relevance = ctx["client_http"].get("/", params={"query": QUERY_WORD}).text
+    assert "2 resultados" in relevance
+    assert "ordenado por" not in relevance  # relevance shows the bare count
+
+
+# --- Story 7.5 — the sort bar control (markup, htmx wiring, no-JS) -------------
+# These assert the SERVER-rendered wiring (the radios, the form attributes, the
+# console hx-include); the client-side behavior is exercised by hand in the PR.
+
+
+def _sortbar(html: str) -> str:
+    start = html.index('class="sortbar"')
+    end = html.index("</form>", start) + len("</form>")
+    return html[start:end]
+
+
+def test_sortbar_selects_current_mode_per_order(ctx):
+    for mode, value in (("recent", "recent"), ("oldest", "oldest")):
+        html = ctx["client_http"].get(
+            "/", params={"query": QUERY_WORD, "sort": mode}
+        ).text
+        bar = _sortbar(html)
+        assert f'<option value="{value}" selected>' in bar
+        assert '<option value="relevance"' in bar
+
+
+def test_sortbar_default_is_relevance(ctx):
+    bar = _sortbar(ctx["client_http"].get("/", params={"query": QUERY_WORD}).text)
+    assert '<option value="relevance" selected>' in bar
+    # the pt-BR labels, lowercase house style
+    for label in ("mais relevantes", "mais recentes", "mais antigos"):
+        assert label in bar
+    assert '<label class="visually-hidden" for="sort-mode">ordenar por:</label>' in bar
+
+
+def test_sortbar_no_js_contract(ctx):
+    """A real GET form: action/method, hidden query, a sort <select> with
+    three options — and no submit button: selection reorders via htmx, and
+    without JS the sorted screen stays reachable by URL (decision D12)."""
+    bar = _sortbar(ctx["client_http"].get("/", params={"query": QUERY_WORD}).text)
+    assert 'action="/" method="get"' in bar
+    assert '<input type="hidden" name="query" value="' in bar
+    assert '<select' in bar and 'name="sort"' in bar
+    assert bar.count("<option value=") == 3
+    assert "<button" not in bar
+
+
+def test_sortbar_htmx_contract(ctx):
+    """The form fetches the full page, swaps #resultados, pushes the URL."""
+    bar = _sortbar(ctx["client_http"].get("/", params={"query": QUERY_WORD}).text)
+    assert 'hx-get="/"' in bar
+    assert 'hx-select="#resultados"' in bar
+    assert 'hx-target="#resultados"' in bar
+    assert 'hx-push-url="true"' in bar
+    assert 'hx-trigger="change"' in bar
+
+
+def test_sortbar_announces_reorder_to_screen_readers(ctx):
+    bar = _sortbar(ctx["client_http"].get("/", params={"query": QUERY_WORD, "sort": "recent"}).text)
+    assert 'role="status"' in bar
+    assert "resultados reordenados por mais recentes" in bar
+
+
+def test_console_input_carries_the_sort_select(ctx):
+    """Live typing on the console preserves the active sort via hx-include."""
+    html = ctx["client_http"].get("/", params={"query": QUERY_WORD}).text
+    start = html.index('class="console"')
+    console = html[start : html.index("</form>", start)]
+    assert 'hx-include=' in console
+    assert "select[name='sort']" in console
+
+
+def test_sortbar_absent_in_empty_state(ctx):
+    """No results → no sort bar (it lives inside the results branch). An empty
+    collection returns zero points, so the empty state renders without it."""
+    import mc.qdrant as q
+
+    empty = f"mc-bdd-empty-{uuid.uuid4().hex[:8]}"
+    ensure_collection(ctx["client"], empty)
+    original = q.embed_passage
+    q.embed_passage = lambda texts: [[0.5] * 384 for _ in texts]
+    try:
+        app = create_app(client=ctx["client"], collection=empty, state=ctx["state"])
+        html = TestClient(app).get("/", params={"query": "zzz-nada"}).text
+    finally:
+        q.embed_passage = original
+        ctx["client"].delete_collection(empty)
+    assert 'class="sortbar"' not in html
+
+
 # --- Story 6.5 — "status do acervo" below everything ------------------------
 
 
@@ -372,3 +505,149 @@ def envelope_has_archive_status(ctx, seconds, videos):
     status = ctx["body"]["archive_status"]
     assert status["seconds"] == int(seconds)
     assert status["videos"] == int(videos)
+
+
+# --- Story 7.4 — sorting the current results by date (integration) -------------
+# A dedicated 3-video collection (isolated from the default seed) so the count
+# and order are exact: two dated episodes plus one undated (#1034), all matching
+# QUERY_WORD.
+
+
+def _seed_sort_three(ctx, d1: str, d2: str, episode: str) -> None:
+    import mc.qdrant as q
+
+    collection = f"mc-bdd-srt-{uuid.uuid4().hex[:8]}"
+    ensure_collection(ctx["client"], collection)
+    original = q.embed_passage  # constant dense so seeding is instant
+    q.embed_passage = lambda texts: [[0.5] * 384 for _ in texts]
+    try:
+        specs = [
+            ("rs1", d1, "1000", f"o {QUERY_WORD} reagiu ao boato"),
+            ("rs2", d2, "500", f"o {QUERY_WORD} subiu de novo"),
+            ("rs3", None, episode, f"o {QUERY_WORD} caiu hoje"),  # undated
+        ]
+        for vid, date, ep, text in specs:
+            upsert_video(
+                ctx["client"],
+                collection,
+                vid,
+                [
+                    Chunk(
+                        video_id=vid,
+                        text=text,
+                        url=f"https://www.youtube.com/watch?v={vid}&t=10",
+                        start_seconds=10,
+                        date=date,
+                        episode=ep,
+                        channel="morning crypto",
+                    )
+                ],
+            )
+    finally:
+        q.embed_passage = original
+    ctx["sort_collection"] = collection
+    ctx["sort_app"] = create_app(
+        client=ctx["client"],
+        collection=collection,
+        state=ctx["state"],
+    )
+    ctx["sort_http"] = TestClient(ctx["sort_app"])
+
+
+@given(
+    parsers.parse(
+        'the archive contains episodes dated "{d1}" and "{d2}" '
+        "and an undated episode #{episode}"
+    )
+)
+def seed_sort_three_episodes(ctx, d1, d2, episode):
+    _seed_sort_three(ctx, d1, d2, episode)
+
+
+@when(parsers.parse('I search "{query}" with sort "{sort_mode}"'))
+def search_with_sort(ctx, query, sort_mode):
+    ctx["response"] = ctx["sort_http"].get(
+        "/", params={"query": query, "sort": sort_mode}
+    )
+    ctx["html"] = ctx["response"].text
+
+
+@then(parsers.parse('the first result shows date "{date}"'))
+def first_result_shows_date(ctx, date):
+    # newest-first under "recent": this date precedes the older dated episode
+    assert ctx["html"].index(date) < ctx["html"].index("2021-03-01")
+
+
+@then('the "sem data" result appears last')
+def undated_result_appears_last(ctx):
+    pos = ctx["html"].index("sem data")
+    assert ctx["html"].index("2026-10-20") < pos  # both dated results come first
+    assert ctx["html"].index("2021-03-01") < pos
+
+
+@then(parsers.parse('the caption reads "{caption}"'))
+def caption_reads(ctx, caption):
+    assert caption in ctx["html"], caption
+
+
+@then("the page renders 200 with relevance order")
+def page_200_relevance(ctx):
+    assert ctx["response"].status_code == 200
+    assert "3 resultados" in ctx["html"]
+    assert "ordenado por" not in ctx["html"]  # "weird" coerced to relevance
+
+
+# --- Story 7.5 — sort control reflects / changes the active order (wiring) -----
+
+
+@given('I searched "bitcoin" with the default order')
+def searched_default_order(ctx):
+    ctx["response"] = ctx["client_http"].get("/", params={"query": "bitcoin"})
+    ctx["html"] = ctx["response"].text
+
+
+@then('the sort bar shows "mais relevantes" selected')
+def bdd_sortbar_default_selected(ctx):
+    assert 'class="sortbar"' in ctx["html"]
+    assert '<option value="relevance" selected>' in ctx["html"]
+
+
+@when('I activate "mais antigos"')
+def bdd_activate_oldest(ctx):
+    pass  # the assertions below verify the server-rendered wiring that drives it
+
+
+@then('the request URL carries "sort=oldest" and the page URL is "/?query=bitcoin&sort=oldest"')
+def bdd_url_carries_sort_oldest(ctx):
+    bar = ctx["html"][ctx["html"].index('class="sortbar"') :]
+    assert 'hx-get="/"' in bar  # fetches the full page
+    assert 'hx-push-url="true"' in bar  # pushes the shareable URL
+    assert 'value="oldest"' in bar  # the "mais antigos" option → ?sort=oldest
+    assert '<input type="hidden" name="query" value="bitcoin">' in bar
+
+
+@then("the console input's htmx wiring includes the sort select")
+def bdd_console_includes_sort(ctx):
+    start = ctx["html"].index('class="console"')
+    console = ctx["html"][start : ctx["html"].index("</form>", start)]
+    assert 'hx-include=' in console
+    assert "select[name='sort']" in console
+
+
+# --- Story 7.6 — sort bar styling lives in mc.css (string-test pattern) --------
+
+
+def test_sortbar_styles_present_in_css_and_template():
+    """The .sortbar grammar is authored in mc.css and referenced by the
+    template; focus-visible + reduced-motion are honored and no new asset is
+    introduced (the CDN test below stays green)."""
+    from pathlib import Path
+
+    repo = Path(__file__).parent.parent
+    css = (repo / "src/mc/api/static/css/mc.css").read_text(encoding="utf-8")
+    template = (repo / "src/mc/api/templates/results.html").read_text(encoding="utf-8")
+    assert ".sortbar" in css  # the control's own styles
+    assert ".sortbar-select" in css  # the dropdown's own styles
+    assert "focus-visible" in css  # visible focus at every stop (existing rule)
+    assert "prefers-reduced-motion" in css  # motion respected
+    assert 'class="sortbar"' in template  # the template wires it up

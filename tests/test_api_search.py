@@ -156,7 +156,8 @@ def response_status(ctx, code):
 @then("the body matches the /search contract")
 def contract_shape(ctx):
     body = ctx["response"].json()
-    assert set(body) == {"query", "took_ms", "freshness", "results"}
+    assert set(body) == {"query", "took_ms", "freshness", "sort", "results"}
+    assert body["sort"] == "relevance"  # default effective mode, always present
     assert body["query"] == "bitcoin"
     assert isinstance(body["took_ms"], int | float)
     assert "last_update" in body["freshness"]
@@ -199,9 +200,11 @@ def agent_envelope(ctx):
         "took_ms",
         "freshness",
         "archive_status",
+        "sort",
         "results",
     }
     assert body["query"] == "bitcoin"
+    assert body["sort"] == "relevance"  # default effective mode, always present
     assert body["agent"]["name"] == "Muriel"
     assert isinstance(body["took_ms"], int | float)
     for result in body["results"]:
@@ -317,6 +320,64 @@ def test_poisoned_url_and_video_id_are_sanitized(tmp_path, monkeypatch):
     assert "youtube-nocookie.com/embed/video000001" in html  # valid id renders
     # the poisoned id fails the strict pattern → no iframe rendered at all
     assert "youtube-nocookie.com/embed/javascript" not in html
+
+
+def test_search_echoes_effective_sort_mode(tmp_path, monkeypatch):
+    """Story 7.2: /search echoes the effective sort; default is relevance."""
+    from mc.api import app as app_module
+    from mc.state import StateStore
+
+    monkeypatch.setattr(app_module, "run_search", lambda *a, **k: [])
+    state = StateStore(tmp_path / "ingest.db")
+    client = TestClient(app_module.create_app(client=object(), state=state))
+    assert client.get("/search", params={"query": "x"}).json()["sort"] == "relevance"
+    assert (
+        client.get("/search", params={"query": "x", "sort": "recent"}).json()["sort"]
+        == "recent"
+    )
+    assert (
+        client.get("/search", params={"query": "x", "sort": "oldest"}).json()["sort"]
+        == "oldest"
+    )
+
+
+def test_search_rejects_invalid_sort(tmp_path, monkeypatch):
+    """The strict machine door 422s on an invalid sort (never silently reorders)."""
+    from mc.api import app as app_module
+    from mc.state import StateStore
+
+    monkeypatch.setattr(app_module, "run_search", lambda *a, **k: [])
+    state = StateStore(tmp_path / "ingest.db")
+    client = TestClient(app_module.create_app(client=object(), state=state))
+    assert (
+        client.get("/search", params={"query": "x", "sort": "garbage"}).status_code == 422
+    )
+
+
+def test_render_json_echoes_sort_and_rejects_invalid(tmp_path, monkeypatch):
+    """Story 7.2: the agent door validates sort strictly (422), echoes the
+    effective mode, and the no-query manual branch still echoes "relevance"."""
+    from mc.api import app as app_module
+    from mc.state import StateStore
+
+    monkeypatch.setattr(app_module, "run_search", lambda *a, **k: [])
+    state = StateStore(tmp_path / "ingest.db")
+    client = TestClient(app_module.create_app(client=object(), state=state))
+    assert (
+        client.get(
+            "/", params={"query": "x", "render": "json", "sort": "oldest"}
+        ).json()["sort"]
+        == "oldest"
+    )
+    # strict: a bad sort rejects the agent rather than silently reordering
+    assert (
+        client.get(
+            "/", params={"query": "x", "render": "json", "sort": "garbage"}
+        ).status_code
+        == 422
+    )
+    # the no-query manual branch echoes the effective sort (default relevance)
+    assert client.get("/", params={"render": "json"}).json()["sort"] == "relevance"
 
 
 def test_security_headers_on_every_response(tmp_path):

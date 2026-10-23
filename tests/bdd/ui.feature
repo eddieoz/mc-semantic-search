@@ -45,3 +45,25 @@ Feature: Search page (HTML + htmx)
     Given the archive has 3556 catalogued videos totalling 197342 seconds
     When I request "/" with render=json
     Then the envelope includes "archive_status" with seconds 197342 and videos 3556
+
+  Scenario: Sorting the current results by most recent
+    Given the archive contains episodes dated "2026-10-20" and "2021-03-01" and an undated episode #1034
+    When I search "bolha" with sort "recent"
+    Then the first result shows date "2026-10-20"
+    And the "sem data" result appears last
+    And the caption reads "3 resultados · ordenado por mais recentes"
+
+  Scenario: Invalid sort falls back to relevance on the human doors
+    Given the archive contains episodes dated "2026-10-20" and "2021-03-01" and an undated episode #1034
+    When I search "bolha" with sort "weird"
+    Then the page renders 200 with relevance order
+
+  Scenario: The sort control reflects and changes the active order
+    Given I searched "bitcoin" with the default order
+    Then the sort bar shows "mais relevantes" selected
+    When I activate "mais antigos"
+    Then the request URL carries "sort=oldest" and the page URL is "/?query=bitcoin&sort=oldest"
+
+  Scenario: The active sort survives typing a new query
+    Given I searched "bitcoin" with the default order
+    Then the console input's htmx wiring includes the sort select

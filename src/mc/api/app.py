@@ -38,7 +38,7 @@ from mc.search.cache import ResultCache
 from mc.search.engine import SearchResult
 from mc.search.engine import search as run_search
 from mc.search.query import parse_query
-from mc.search.ranking import apply_boost
+from mc.search.ranking import SortMode, apply_boost, apply_sort
 from mc.search.snippets import build_snippet
 from mc.state import StateStore
 
@@ -69,6 +69,12 @@ _SEARCH_KEYS = (
 
 # DoS guard for the render switch — only the literal value "json" means JSON.
 MAX_RENDER_LENGTH = 16
+
+# The three accepted sort modes. The machine doors validate against this
+# (invalid → 422); the human doors coerce anything else to "relevance" — the
+# same strict/graceful split the ``render`` switch already follows.
+SORT_MODES = ("relevance", "recent", "oldest")
+MAX_SORT_LENGTH = 32
 
 TEMPLATES = Jinja2Templates(
     directory=Path(__file__).parent / "templates", autoescape=True
@@ -155,6 +161,19 @@ def _freshness_line(last_update: str | None) -> str:
         return "acervo atualizado agora mesmo."
     date = last_update[:10]
     return f"acervo atualizado até {date}"
+
+
+# pt-BR label per date mode, for the caption above the ledger (Story 7.4/7.5).
+_SORT_LABELS = {"recent": "mais recentes", "oldest": "mais antigos"}
+
+
+def _results_caption(results_count: int, sort: str) -> str:
+    """Caption above the ledger: ``N resultados``, plus ``· ordenado por X``
+    only when the mode is not relevance (the lowercase house grammar of
+    ``.hit-meta``; relevance shows the bare count)."""
+    caption = f"{_fmt_int_pt(results_count)} resultados"
+    label = _SORT_LABELS.get(sort)
+    return f"{caption} · ordenado por {label}" if label else caption
 
 
 def _safe_url(url: str | None, video_id: str | None) -> str:
@@ -296,7 +315,9 @@ def create_app(
         except Exception:  # noqa: BLE001 — stats must never break the API
             return _raw_archive_status({})
 
-    def _video_results(query: str, effective_limit: int) -> list[dict]:
+    def _video_results(
+        query: str, effective_limit: int, sort: SortMode = "relevance"
+    ) -> list[dict]:
         try:
             results: list[SearchResult] = run_search(
                 qdrant,
@@ -310,32 +331,50 @@ def create_app(
                 status_code=503, detail="qdrant unreachable"
             ) from exc
         results = apply_boost(results, parse_query(query))
+        # Single choke point (D2): apply_sort runs here, right after apply_boost,
+        # so took_ms covers all post-processing and the three routes can't drift.
+        # sort is post-retrieval only — no second query, no Qdrant order_by.
+        results = apply_sort(results, sort)
         return [_video_result(r, query) for r in results]
 
     @app.get("/search")
     def search_endpoint(
         query: str = Query(min_length=1, max_length=MAX_QUERY_LENGTH),
         limit: int = Query(default=10, ge=1),
+        sort: str = Query(default="relevance", max_length=MAX_SORT_LENGTH),
     ) -> dict:
+        # Strict machine door (D5): an invalid sort is rejected, never silently
+        # reordered — same 422 strictness as the oversized-query guard.
+        if sort not in SORT_MODES:
+            raise HTTPException(status_code=422, detail=f"invalid sort: {sort!r}")
         effective_limit = min(limit, MAX_SEARCH_LIMIT)
         started = time.perf_counter()
-        results = _video_results(query, effective_limit)
+        results = _video_results(query, effective_limit, sort)  # type: ignore[arg-type]
         took_ms = (time.perf_counter() - started) * 1000
         return {
             "query": query,
             "took_ms": took_ms,
             "freshness": _freshness(),
+            "sort": sort,  # effective mode, always present (validated above)
             "results": _search_results(results),
         }
 
     @app.get("/results", response_class=HTMLResponse)
     def results_partial(
-        query: str = Query(default="", max_length=MAX_QUERY_LENGTH)
+        query: str = Query(default="", max_length=MAX_QUERY_LENGTH),
+        sort: str = Query(default="relevance", max_length=MAX_SORT_LENGTH),
     ) -> str:
-        results = _video_results(query, MAX_SEARCH_LIMIT) if query.strip() else []
+        # Human door: coerce an invalid sort to relevance (rule 7), never 422.
+        effective_sort = sort if sort in SORT_MODES else "relevance"
+        results = (
+            _video_results(query, MAX_SEARCH_LIMIT, effective_sort) if query.strip() else []
+        )
         return TEMPLATES.get_template("results.html").render(
             results=results,
             query=query,
+            sort=effective_sort,
+            results_count=len(results),
+            caption=_results_caption(len(results), effective_sort),
             freshness_line=_freshness_line(_freshness()["last_update"]),
         )
 
@@ -344,11 +383,21 @@ def create_app(
         request: Request,
         query: str = Query(default="", max_length=MAX_QUERY_LENGTH),
         render: str = Query(default="", max_length=MAX_RENDER_LENGTH),
+        sort: str = Query(default="relevance", max_length=MAX_SORT_LENGTH),
     ):
         stripped = query.strip()
         started = time.perf_counter()
-        results = _video_results(query, MAX_SEARCH_LIMIT) if stripped else []
-        if render.strip().lower() == "json":
+        is_json = render.strip().lower() == "json"
+        # Strict for the agent door, graceful for humans (the render split, D5):
+        # an agent that names a bad sort is rejected (422) so it reads back what
+        # it asked for; a human who typos just gets relevance, never a 422 page.
+        if is_json and sort not in SORT_MODES:
+            raise HTTPException(status_code=422, detail=f"invalid sort: {sort!r}")
+        effective_sort: SortMode = sort if sort in SORT_MODES else "relevance"
+        results = (
+            _video_results(query, MAX_SEARCH_LIMIT, effective_sort) if stripped else []
+        )
+        if is_json:
             # The agent door (moltbook pattern): the landing page answers in
             # machine-readable form. No query → Muriel's self-description;
             # a query → the /search envelope plus the agent block, so every
@@ -361,6 +410,7 @@ def create_app(
                     "took_ms": took_ms,
                     "freshness": _freshness(),
                     "archive_status": _raw_archive_stats(),
+                    "sort": effective_sort,
                     "results": _search_results(results),
                 }
             )
@@ -370,6 +420,9 @@ def create_app(
             context={
                 "query": stripped,
                 "results": results,
+                "sort": effective_sort,
+                "results_count": len(results),
+                "caption": _results_caption(len(results), effective_sort),
                 "freshness_line": _freshness_line(_freshness()["last_update"]),
                 "archive_status": _archive_stats(),
                 "agent_box": agent_docs.landing_box(),

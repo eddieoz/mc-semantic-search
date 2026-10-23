@@ -78,6 +78,8 @@ def manual(base_url: str | None = None) -> dict:
             "query": "texto livre; entre aspas duplas exige o trecho literal",
             "limit": "1–50 (padrão 10)",
             "render": "valor json devolve JSON; sem ele, HTML",
+            "sort": "relevance|recent|oldest (padrão relevance); recent/oldest "
+            "reordenam por data (sem data por último)",
         },
         "result_fields": {
             "title": "episódio (fallback: vídeo)",
@@ -87,7 +89,8 @@ def manual(base_url: str | None = None) -> dict:
             "episode": "número do episódio",
             "channel": "canal",
             "snippet": "trecho da transcrição com <mark> no termo",
-            "score": "relevância (maior = melhor)",
+            "score": "relevância por resultado (maior = melhor); sob "
+            "recent/oldest a ordem é por data e o score não segue a posição",
         },
         "note": "para assistir o momento: abra url e avance para start_seconds",
     }
@@ -97,7 +100,8 @@ def llms_txt(base_url: str | None = None) -> str:
     """llmstxt.org canonical shape: every H2 section is a link list, each
     line exactly ``- [name](url): optional notes``. Strict validators reject
     plain text inside sections, so params and field docs live in the notes
-    (``query``/``render`` on the search link, ``limit`` on the API link) and
+    (``query``/``render`` on the search link, ``limit``/``sort`` on the API
+    link) and
     each result field is its own list item pointing at the JSON envelope."""
     m = manual(base_url)
     search_url, api_url, manual_url = endpoints(base_url)
@@ -114,7 +118,8 @@ def llms_txt(base_url: str | None = None) -> str:
             "termo; query é texto livre (aspas duplas exigem o trecho "
             "literal); devolve JSON em vez da página HTML",
             f"- [API /search]({api_url}): API JSON pura; limit 1–50 "
-            "(padrão 10)",
+            "(padrão 10); sort: relevance|recent|oldest (padrão relevance) — "
+            "recent/oldest reordenam por data, sem data por último",
             f"- [Manual /llms.txt]({manual_url}): este manual em texto puro",
             "- [Busca no Blog](https://eddieoz.com/llms.txt): Consulte também no "
             "Blog: artigos, documentos, entrevistas, tutoriais, apresentações e "
@@ -129,7 +134,9 @@ def llms_txt(base_url: str | None = None) -> str:
             f"- [episode]({envelope}): número do episódio",
             f"- [channel]({envelope}): canal",
             f"- [snippet]({envelope}): trecho da transcrição com <mark> no termo",
-            f"- [score]({envelope}): relevância (maior = melhor)",
+            f"- [score]({envelope}): relevância por resultado (maior = "
+            "melhor); sob sort recent/oldest a ordem é por data e o score não "
+            "cresce com a posição",
             f"- [como assistir]({envelope}): abra url e avance para start_seconds",
             "",
             "## Status do acervo",

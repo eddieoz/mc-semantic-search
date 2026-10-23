@@ -40,6 +40,10 @@
       hx-trigger="input changed delay:300ms, search"
       hx-target="#resultados"
       hx-sync="this:replace"
+      {# Story 7.5/7.8: carry the active sort into every live-typing request, so
+         typing never resets the chosen order (the sort <select> lives in
+         #resultados) #}
+      hx-include="#resultados select[name='sort']"
     >
     <button type="submit">buscar</button>
     <span class="htmx-indicator console-busy" aria-hidden="true">···</span>

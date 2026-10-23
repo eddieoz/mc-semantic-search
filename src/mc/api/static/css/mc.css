@@ -165,6 +165,87 @@ body {
   width: 1.5rem;
 }
 
+/* ---------- ordenar por (Story 7.6, redesigned 7.8/7.9) ---------- */
+/* Toolbar row: result count left, sort control right — the HuggingFace
+   arrangement. The control is a compact native <select> pill showing only the
+   current order; selection reorders instantly via htmx, so there is no submit
+   button (decision D12 — without JS the sorted screen stays reachable by
+   URL). The mono metadata grammar keeps it reading as archive furniture, not
+   chrome; the amber caret and focus ring mark it on the near-black terminal. */
+
+.results-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: calc(var(--mc-rhythm) * 2);
+  margin: 0 0 calc(var(--mc-rhythm) * 4);
+  padding-bottom: calc(var(--mc-rhythm) * 3);
+  border-bottom: 1px solid var(--mc-line);
+}
+
+.results-caption {
+  margin: 0;
+  font-family: var(--mc-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--mc-ink-dim);
+}
+
+.sortbar {
+  display: flex;
+  align-items: center;
+}
+
+/* the caret host: CSP img-src has no data:, so the chevron is drawn with a
+   border triangle instead of any image resource */
+.sortbar-caret {
+  position: relative;
+  display: inline-flex;
+}
+
+.sortbar-caret::after {
+  content: "";
+  position: absolute;
+  right: calc(var(--mc-rhythm) * 1.5);
+  top: 50%;
+  translate: 0 -50%;
+  width: 0;
+  height: 0;
+  border-left: 0.28rem solid transparent;
+  border-right: 0.28rem solid transparent;
+  border-top: 0.34rem solid var(--mc-amber);
+  pointer-events: none; /* clicks fall through to the select */
+}
+
+.sortbar-select {
+  appearance: none;
+  -webkit-appearance: none;
+  display: inline-block;
+  min-height: 2rem;
+  padding: calc(var(--mc-rhythm) * 1) calc(var(--mc-rhythm) * 4)
+    calc(var(--mc-rhythm) * 1) calc(var(--mc-rhythm) * 2);
+  background-color: var(--mc-ground-2);
+  color: var(--mc-ink);
+  font-family: var(--mc-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  border: 1px solid var(--mc-line);
+  border-radius: 2px;
+}
+
+.sortbar-select:hover {
+  border-color: var(--mc-amber);
+}
+
+.sortbar-select:focus-visible {
+  outline: 2px solid var(--mc-amber);
+  outline-offset: 2px;
+}
+
 /* ---------- results ledger ---------- */
 
 .ledger {
