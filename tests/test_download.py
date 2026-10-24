@@ -73,6 +73,11 @@ def test_language_priority_list_and_per_attempt_options(tmp_path):
         assert ydl_opts["writesubtitles"] is True
         assert ydl_opts["writeautomaticsub"] is True
         assert ydl_opts["skip_download"] is True
+        # Subtitle-only runs must survive extraction with zero media formats:
+        # when the n-challenge can't be solved (no JS runtime, e.g. the
+        # production server), yt-dlp raises a fatal "Requested format is not
+        # available" before writing subtitles unless this flag is set.
+        assert ydl_opts["ignore_no_formats_error"] is True
         # Failures must raise into the classification path, never be swallowed.
         assert ydl_opts["ignoreerrors"] is False
 

@@ -135,6 +135,11 @@ def _build_ydl_opts(
         "subtitleslangs": [lang],  # only request THIS language
         "subtitlesformat": "json3",
         "skip_download": True,
+        # We never need a media format. Without this, a run that yields zero
+        # playable formats (n-challenge unsolved — no JS runtime on the prod
+        # server) dies with "Requested format is not available" BEFORE the
+        # subtitles are written, even though extraction itself succeeded.
+        "ignore_no_formats_error": True,
         "outtmpl": str(transcripts_dir / "%(id)s.%(ext)s"),
         # Optimal sleep parameters per yt-dlp recommendations (v3 values).
         "sleep_requests": 1,
