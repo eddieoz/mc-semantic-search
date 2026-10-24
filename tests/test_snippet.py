@@ -1,4 +1,4 @@
-"""Story 4.4 — snippet selection & highlighting."""
+"""Story 4.4 / Story 4.10 — snippet selection, context window & highlighting."""
 
 from __future__ import annotations
 
@@ -20,7 +20,9 @@ def test_picks_sentence_with_max_term_overlap():
     for word in ["bitcoin", "bolha", "analistas"]:
         assert f"<mark>{word}</mark>" in snip.highlighted
     assert "segundo muitos" in snip.highlighted
-    assert "regulação" not in snip.highlighted
+    # Story 4.10: a short chunk fits the window whole, so neighboring
+    # context (the next sentence) is now part of the snippet.
+    assert "regulação" in snip.highlighted
 
 
 def test_semantic_overlap_fallback_to_chunk_start():
@@ -98,3 +100,75 @@ def test_short_query_words_excluded_from_sentence_choice():
     text = "Falei do bitcoin ontem à noite. E e e e e nada mais aqui."
     snip = build_snippet(text, "bitcoin é")
     assert "bitcoin" in snip.highlighted
+
+
+# --- Story 4.10: context window around the best sentence ---------------------
+
+
+def test_window_grows_after_before_then_stops_at_cap():
+    """The window appends the FOLLOWING sentence first, then prepends the
+    preceding one — and stops growing at the cap (far sentences excluded)."""
+    before = "Antes disso falamos longamente de assuntos domésticos, congresso, impostos e outras pautas. "  # noqa: E501
+    best = (
+        "O bitcoin é uma bolha segundo muitos analistas da região que acompanham o mercado. "
+    )
+    after = "E subiu bem. "
+    tail = "Por fim encerramos o programa de hoje com os agradecimentos finais."
+    snip = build_snippet(before + best + after + tail, "bitcoin bolha", max_len=120)
+    assert "analistas" in snip.highlighted  # best sentence in
+    assert "subiu" in snip.highlighted  # following sentence pulled in first
+    assert "domésticos" not in snip.highlighted  # doesn't fit the cap
+    assert "encerramos" not in snip.highlighted
+
+
+def test_window_cap_and_ellipses_on_cut_edges():
+    """A long chunk is cut to ~max_len of source text, with … at every edge
+    that isn't the chunk boundary."""
+    pads = [
+        f"A frase de número {i} trata do noticiário e da política do dia."
+        for i in range(10)
+    ]
+    best = "O mercado de criptomoedas reage forte à economia global deste mês."
+    text = " ".join(pads[:5] + [best] + pads[5:])
+    snip = build_snippet(text, "criptomoedas economia", max_len=200)
+    plain = re.sub(r"<[^>]+>", "", snip.highlighted)
+    assert len(plain) <= 200 + 2 * 2 + 1  # cap + two "…" + join slack
+    assert snip.highlighted.startswith("…")
+    assert snip.highlighted.endswith("…")
+    assert "número 0" not in plain  # the cut dropped the chunk start
+    assert "número 9" not in plain  # …and the chunk end
+
+
+def test_short_chunk_has_no_ellipses():
+    """A window that covers the whole chunk must not advertise a cut."""
+    snip = build_snippet(TEXT, "bitcoin bolha")
+    assert "…" not in snip.highlighted
+
+
+def test_oversized_sentence_centers_on_query_term():
+    """Old-era chunks are one giant unpunctuated 'sentence': the slice must
+    center on the first query term so the <mark> survives the cut."""
+    filler_a = "palavra de enchimento " * 30  # ~420 chars before the topic
+    topic = "a teoria da ilha das américas explica o cenário geopolítico atual "
+    filler_b = "mais enchimento irrelevante aqui " * 12  # ~460 chars after
+    snip = build_snippet(filler_a + topic + filler_b, "ilha das américas")
+    plain = re.sub(r"<[^>]+>", "", snip.highlighted)
+    assert "<mark>ilha</mark>" in snip.highlighted
+    assert "<mark>américas</mark>" in snip.highlighted
+    assert len(plain) <= 1200 + 2 * 2 + 1
+    assert snip.highlighted.startswith("…")
+    assert snip.highlighted.endswith("…")
+
+
+def test_has_literal_spans_window_not_just_best_sentence():
+    """The exact phrase may sit in a NEIGHBORING sentence pulled into the
+    window: has_literal must reflect the visible snippet, not the 4.4-era
+    single-sentence choice."""
+    best = "A ilha aparece na teoria clássica das potências mundiais e das américas. "
+    neighbor = "Ele defende a teoria da ilha das américas."
+    snip = build_snippet(best + neighbor, "teoria da ilha das américas")
+    assert snip.has_literal is True
+    plain = html.unescape(re.sub(r"<[^>]+>", "", snip.highlighted))
+    from mc.search.query import normalize
+
+    assert normalize("teoria da ilha das américas") in normalize(plain)

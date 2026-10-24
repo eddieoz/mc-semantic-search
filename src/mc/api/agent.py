@@ -88,7 +88,7 @@ def manual(base_url: str | None = None) -> dict:
             "date": "data de publicação (AAAA-MM-DD)",
             "episode": "número do episódio",
             "channel": "canal",
-            "snippet": "trecho da transcrição com <mark> no termo",
+            "snippet": "janela de contexto (~1200 caracteres) com <mark> no termo",
             "score": "relevância por resultado (maior = melhor); sob "
             "recent/oldest a ordem é por data e o score não segue a posição",
         },
@@ -133,7 +133,8 @@ def llms_txt(base_url: str | None = None) -> str:
             f"- [date]({envelope}): data de publicação (AAAA-MM-DD)",
             f"- [episode]({envelope}): número do episódio",
             f"- [channel]({envelope}): canal",
-            f"- [snippet]({envelope}): trecho da transcrição com <mark> no termo",
+            f"- [snippet]({envelope}): janela de contexto (~1200 caracteres) "
+            "da transcrição com <mark> no termo",
             f"- [score]({envelope}): relevância por resultado (maior = "
             "melhor); sob sort recent/oldest a ordem é por data e o score não "
             "cresce com a posição",
