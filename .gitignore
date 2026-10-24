@@ -40,3 +40,6 @@ transcripts/
 # Session tooling (agent plans, local-only)
 .zcode/
 .serena/
+
+# Task notes / epics / runbooks are local-only (purged from git history 2026-10-24)
+docs/tasks/*
