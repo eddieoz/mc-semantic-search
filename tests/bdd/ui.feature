@@ -67,3 +67,8 @@ Feature: Search page (HTML + htmx)
   Scenario: The active sort survives typing a new query
     Given I searched "bitcoin" with the default order
     Then the console input's htmx wiring includes the sort select
+
+  Scenario: Static assets are cache-busted so a deploy never ships stale styles
+    Given I am on the search page
+    Then every vendored asset URL carries the file's content-hash version
+    And /static responses demand revalidation with no-cache

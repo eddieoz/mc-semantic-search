@@ -8,6 +8,7 @@ app against local qdrant, unreachable clients or tmp state stores.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from contextlib import contextmanager
@@ -75,6 +76,24 @@ MAX_RENDER_LENGTH = 16
 # same strict/graceful split the ``render`` switch already follows.
 SORT_MODES = ("relevance", "recent", "oldest")
 MAX_SORT_LENGTH = 32
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+def _asset_version(rel: str) -> str:
+    """Content hash suffix for /static URLs — ``?v=`` cache busting.
+
+    /static used to send no Cache-Control, so browsers heuristically kept an
+    old stylesheet across a deploy and rendered fresh HTML (new sortbar
+    markup) with stale CSS — Pico's full-width select instead of the compact
+    sort pill. Hashing the file into the URL makes every deploy a new cache
+    key; the header half of the fix lives in the security-headers middleware.
+    """
+    try:
+        digest = hashlib.sha256((_STATIC_DIR / rel).read_bytes()).hexdigest()
+    except OSError:  # missing asset must never 500 the page
+        return "0"
+    return digest[:12]
 
 TEMPLATES = Jinja2Templates(
     directory=Path(__file__).parent / "templates", autoescape=True
@@ -276,11 +295,16 @@ def create_app(
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        if request.url.path.startswith("/static/"):
+            # Second half of the cache-bust fix: even unversioned references
+            # (favicon) revalidate each load — cheap 304 via the ETag
+            # StaticFiles already sends — instead of heuristic staleness.
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
     app.mount(
         "/static",
-        StaticFiles(directory=Path(__file__).parent / "static"),
+        StaticFiles(directory=_STATIC_DIR),
         name="static",
     )
     # Story 4.7 wiring (review fix): every app gets the embedder-level LRU by
@@ -426,6 +450,7 @@ def create_app(
                 "freshness_line": _freshness_line(_freshness()["last_update"]),
                 "archive_status": _archive_stats(),
                 "agent_box": agent_docs.landing_box(),
+                "static_v": _asset_version,
             },
         )
 

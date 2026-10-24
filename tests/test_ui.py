@@ -15,6 +15,7 @@ from pytest_bdd import given, parsers, scenarios, then, when
 from qdrant_client import QdrantClient
 
 from mc.api.app import (
+    _asset_version,
     _fmt_dec_pt,
     _fmt_int_pt,
     _format_archive_status,
@@ -306,6 +307,37 @@ def test_invalid_sort_coerces_to_relevance(ctx):
     resp = ctx["client_http"].get("/", params={"query": QUERY_WORD, "sort": "weird"})
     assert resp.status_code == 200
     assert "ordenado por" not in resp.text  # relevance has no ordering caption
+
+
+# --- Cache-busted assets: fresh HTML must never pair with a stale stylesheet.
+# /static used to send no Cache-Control at all, so browsers heuristically kept
+# the pre-deploy mc.css and rendered the new sort pill with Pico's full-width
+# select defaults — the reported "sort button regression". Content-hashed
+# URLs make every deploy a new cache key; no-cache keeps even unversioned
+# references (favicon) honest between deploys.
+
+VENDORED_ASSETS = (
+    "favicon.svg",
+    "css/pico.min.css",
+    "css/mc.css",
+    "js/htmx.min.js",
+    "js/alpine.min.js",
+    "js/copy.js",
+    "img/logo.png",
+)
+
+
+@then("every vendored asset URL carries the file's content-hash version")
+def asset_urls_cache_busted(ctx):
+    html = ctx["html"]
+    for rel in VENDORED_ASSETS:
+        assert f"/static/{rel}?v={_asset_version(rel)}" in html, rel
+
+
+@then("/static responses demand revalidation with no-cache")
+def static_responses_no_cache(ctx):
+    resp = ctx["client_http"].get("/static/css/mc.css")
+    assert resp.headers["cache-control"] == "no-cache"
 
 
 def test_partial_results_honors_sort(ctx):
