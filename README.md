@@ -145,7 +145,7 @@ src/mc/
    sparse prefetch → RRF fusion) against the aliased collection.
 4. Results pass the quote-aware boost and the snippet highlighter; each
    result is sanitized (https-only URLs, strict video-id validation) and
-   rendered. Snippets are ~400-char context windows around the
+   rendered. Snippets are ~1200-char context windows around the
    best-matching sentence, so both caption eras (old unpunctuated, new
    punctuated) show the same amount of readable context.
 
