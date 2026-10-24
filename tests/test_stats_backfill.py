@@ -1132,9 +1132,21 @@ def test_tab_pass_salvages_partial_output_from_a_failed_tab(tmp_path):
             1,
             _tsv("abc747video", "20240315", "[ IRL ][ ep 747 ] x", "5400.0")
             + "\n"
-            + _tsv("abc747nex9", "20240320", "[ IRL ][ ep 748 ] y", "5300.0")
+            + _tsv("abc747nex9x", "20240320", "[ IRL ][ ep 748 ] y", "5300.0")
             + "\n",
             "ERROR: [youtube] 9_6aaZWmhpI: Sign in to confirm you're not a bot",
+        ),
+        # the other tabs are absent — a _Recorder default of (0, "", "") would
+        # fake a completed pass and inflate tabs_listed
+        "https://youtube.com/@chan/streams": (
+            1,
+            "",
+            "ERROR: [youtube] @chan: This channel does not have a streams tab",
+        ),
+        "https://youtube.com/@chan/shorts": (
+            1,
+            "",
+            "ERROR: [youtube] @chan: This channel does not have a shorts tab",
         ),
     })
 
@@ -1147,7 +1159,8 @@ def test_tab_pass_salvages_partial_output_from_a_failed_tab(tmp_path):
     )
 
     assert report["tabs_failed"] == 1
+    assert report["tabs_skipped"] == 2  # streams/shorts absent, as declared above
     assert report["tabs_listed"] == 0  # the tab did not run to completion
     assert report["videos_seen"] == 2  # salvaged from the failed tab
     assert state.video_facts("abc747video")["date"] == "2024-03-15"
-    assert state.video_facts("abc747nex9")["date"] == "2024-03-20"
+    assert state.video_facts("abc747nex9x")["date"] == "2024-03-20"
