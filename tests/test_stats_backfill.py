@@ -1120,3 +1120,34 @@ def test_tab_pass_overwrites_a_poisoned_cache_entry(tmp_path):
     assert stored["episode"] == "747"
     assert stored["duration"] == 5400
     assert state.video_facts("ab301415cde")["episode"] == 747
+
+
+def test_tab_pass_salvages_partial_output_from_a_failed_tab(tmp_path):
+    """A tab that dies mid-pass (bot gate) may still have extracted dozens of
+    videos before failing — returncode != 0 must not discard their TSV lines,
+    or a flagged session converts a half-finished tab into zero progress."""
+    state, cache_dir, _ = _ctx(tmp_path)
+    rec = _Recorder({
+        "https://youtube.com/@chan/videos": (
+            1,
+            _tsv("abc747video", "20240315", "[ IRL ][ ep 747 ] x", "5400.0")
+            + "\n"
+            + _tsv("abc747nex9", "20240320", "[ IRL ][ ep 748 ] y", "5300.0")
+            + "\n",
+            "ERROR: [youtube] 9_6aaZWmhpI: Sign in to confirm you're not a bot",
+        ),
+    })
+
+    report = run_tab_backfill(
+        state=state,
+        cache_dir=cache_dir,
+        channels=("https://youtube.com/@chan",),
+        runner=rec,
+        sleeper=lambda _: None,
+    )
+
+    assert report["tabs_failed"] == 1
+    assert report["tabs_listed"] == 0  # the tab did not run to completion
+    assert report["videos_seen"] == 2  # salvaged from the failed tab
+    assert state.video_facts("abc747video")["date"] == "2024-03-15"
+    assert state.video_facts("abc747nex9")["date"] == "2024-03-20"

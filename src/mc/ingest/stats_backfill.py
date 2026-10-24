@@ -572,17 +572,20 @@ def run_tab_backfill(
     for channel in channel_urls:
         for tab_url in _channel_tabs(channel):
             result = runner(_tab_argv(tab_url))
-            if result.returncode != 0:
+            completed = result.returncode == 0
+            if not completed:
                 stderr = (result.stderr or "").strip()
                 if _TAB_ABSENT_RE.search(stderr):
                     logger.warning("channel %s has no %s tab — skipped", channel, tab_url)
                     report.tabs_skipped += 1
-                else:
-                    logger.warning("tab pass failed for %s: %s", tab_url, stderr[:400])
-                    report.tabs_failed += 1
-                sleeper(_FETCH_BACKOFF_S)
-                continue
-
+                    sleeper(_FETCH_BACKOFF_S)
+                    continue
+                logger.warning("tab pass failed for %s: %s", tab_url, stderr[:400])
+                report.tabs_failed += 1
+                # fall through: --ignore-errors keeps printing extracted videos
+                # after a failure, so a tab that died mid-pass still yields its
+                # partial TSV — discarding stdout would convert a flagged
+                # session's half-finished tab into zero progress.
             for line in (result.stdout or "").splitlines():
                 parsed = _parse_tab_line(line.strip())
                 if parsed is None:
@@ -646,7 +649,8 @@ def run_tab_backfill(
                         logger.warning(
                             "index payload repair failed for %s", video_id, exc_info=True
                         )
-            report.tabs_listed += 1
+            if completed:
+                report.tabs_listed += 1
             sleeper(_FETCH_BACKOFF_S)
 
     logger.info(report.summary())
