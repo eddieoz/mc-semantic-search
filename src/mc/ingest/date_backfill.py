@@ -48,9 +48,17 @@ def _undated_points(client: QdrantClient, collection: str) -> list:
     """Every indexed point whose payload ``date`` is empty (the undated tail).
 
     One filtered scroll (``is_empty=date``) paged through; the DATETIME index
-    makes this cheap rather than a full collection scan."""
+    makes this cheap rather than a full collection scan. The fingerprint
+    sentinel (point id 0, ``__meta__`` payload) has no date BY DESIGN — it is
+    collection metadata, not a transcript point, and can never be repaired,
+    so it is excluded or it would pollute the audit forever (a production
+    run reported "325 points across 7 videos" that were really 324 + the
+    sentinel)."""
     filt = models.Filter(
-        must=[models.IsEmptyCondition(is_empty=models.PayloadField(key="date"))]
+        must=[models.IsEmptyCondition(is_empty=models.PayloadField(key="date"))],
+        must_not=[
+            models.FieldCondition(key="__meta__", match=models.MatchValue(value=True))
+        ],
     )
     points: list = []
     offset = None

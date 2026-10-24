@@ -39,6 +39,11 @@ class FakeQdrant:
         # IsEmptyCondition.is_empty is the PayloadField itself (has `.key`).
         return getattr(getattr(cond, "is_empty", None), "key", None) == "date"
 
+    @staticmethod
+    def _excludes_meta(filter_) -> bool:
+        must_not = getattr(filter_, "must_not", None) or []
+        return any(getattr(cond, "key", None) == "__meta__" for cond in must_not)
+
     def scroll(
         self, *, collection_name, scroll_filter, limit=1000, offset=None, with_payload=False
     ):
@@ -48,6 +53,8 @@ class FakeQdrant:
             pool = [p for p in self._points if not str(p.payload.get("date") or "").strip()]
         else:
             pool = list(self._points)
+        if self._excludes_meta(scroll_filter):
+            pool = [p for p in pool if not p.payload.get("__meta__")]
         start = offset or 0
         page = pool[start : start + limit]
         next_offset = None if start + limit >= len(pool) else start + limit
@@ -159,3 +166,23 @@ def test_missing_sources_leave_point_untouched(tmp_path):
     assert report["undated_points_after"] == 1
     assert client.patches == []  # never issued a patch for an unknown date
     assert points[0].payload["date"] is None
+
+
+def test_sentinel_meta_point_is_not_counted_as_undated(tmp_path):
+    """The collection fingerprint sentinel (point id 0, ``__meta__`` payload)
+    carries no date BY DESIGN — it is collection metadata, not a transcript
+    point, and can never be repaired. It must never pollute the undated
+    audit (observed in production: "325 points across 7 videos" was really
+    324 transcript points + the sentinel)."""
+    points = [
+        _Point({"__meta__": True, "fingerprint": {"dense": {"dim": 384}}}),
+        _point("v1", None, "1034"),
+    ]
+    client = FakeQdrant(points)
+    state, cache_dir = _ctx(tmp_path)
+
+    report = run_date_backfill(state=state, cache_dir=cache_dir, client=client)
+
+    assert report["undated_points_before"] == 1
+    assert report["undated_points_after"] == 1
+    assert report["undated_videos"] == 1
