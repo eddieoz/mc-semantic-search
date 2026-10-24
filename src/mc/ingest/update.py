@@ -31,6 +31,7 @@ from mc.ingest.download import (
     IGNORE_LIST_FILENAME,
     add_to_ignore_list,
     download_transcript,
+    is_ignored,
 )
 from mc.ingest.lock import RunLock
 from mc.ingest.metadata import enrich, episode_int
@@ -98,7 +99,21 @@ def run_update(
     lock_path = lock_path or DATA_DIR / "update.lock"
 
     discovered = list(discover(channels))
-    new_ids = sorted(vid for vid in discovered if not state.is_processed(vid))
+    # An ignore-listed video is a KNOWN uninjestable (permanently subtitle-less):
+    # re-attempting it every run failed the whole pass and fired the cron alert
+    # forever (observed in production with wtptWokZag8). The list is a
+    # discovery-level exclusion — skip before enrich/download, count it as
+    # neither new nor failed, and let the run exit 0.
+    ignored = {
+        vid for vid in discovered if is_ignored(vid, transcripts_dir / IGNORE_LIST_FILENAME)
+    }
+    if ignored:
+        logger.info(
+            "%d discovered videos are in the ignore list — skipped", len(ignored)
+        )
+    new_ids = sorted(
+        vid for vid in discovered if not state.is_processed(vid) and vid not in ignored
+    )
 
     if dry_run:
         logger.info("dry run: %d new videos would be ingested", len(new_ids))

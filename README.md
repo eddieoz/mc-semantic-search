@@ -482,7 +482,7 @@ owned by uid 1000 to match the container's non-root user.
 | `/health` → `503 {"status": "unreachable"}` | Qdrant down or `QDRANT_URL` wrong: `docker compose ps`, `docker compose logs qdrant` |
 | `/health` → `"stale"` | Last successful ingest older than `FRESHNESS_MAX_HOURS` (72 h). Check the update log; run `mc update --dry-run` to verify cookies |
 | Cron runs exit with `AlreadyRunning` | A previous run still holds the flock (`/run/lock/mc-*.lock`). Wait for it to finish or investigate before clearing |
-| Ingestion silently skips videos | Check `ignored_videos.txt` next to the transcripts. Auth failures (expired cookies) are classified and alerted, not ignore-listed — rotate cookies per docs/tasks/cookies.md and retry |
+| Ingestion silently skips videos | Check `ignored_videos.txt` next to the transcripts. A subtitle-less video fails one run, lands in the list, and is skipped (run exits 0) on every later pass; delete its line to retry. Auth failures (expired cookies) are classified and alerted, not ignore-listed — rotate cookies per docs/tasks/cookies.md and retry |
 | qdrant: `Too many open files` | RocksDB exhausted the fd ulimit; compose sets `nofile: 65536` — keep it |
 | Port 8080 already in use | Compose maps the api to host port 18080 by default; adjust `ports:` in docker-compose.yml |
 | Container: `Permission denied` on data dirs | Bind mounts must be owned by uid 1000 (the container's non-root user): `chown -R 1000:1000 data state snapshots` |

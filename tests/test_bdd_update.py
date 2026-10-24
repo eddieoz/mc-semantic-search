@@ -463,3 +463,61 @@ def test_failed_video_records_no_stats(tmp_path, monkeypatch):
     assert code == 1
     assert state.archive_stats()["videos"] == 0
     client.delete_collection(collection)
+
+
+def test_ignored_video_is_skipped_silently_on_later_runs(tmp_path):
+    """A video already in ignored_videos.txt is a KNOWN uninjestable (e.g.
+    permanently subtitle-less): re-attempting it every run failed the whole
+    pass and fired the cron alert forever (observed with wtptWokZag8). The
+    ignore list is a discovery-level exclusion — the video must be skipped
+    before download, counted as neither new nor failed, and the run must
+    exit 0."""
+    import uuid as _uuid
+
+    from qdrant_client import QdrantClient as QC
+
+    client = QC(url="http://localhost:6333", timeout=30)
+    collection = f"mc-bdd-{_uuid.uuid4().hex[:8]}"
+    state = StateStore(tmp_path / "ingest.db")
+    transcripts_dir = tmp_path / "transcripts"
+    transcripts_dir.mkdir(parents=True)
+    (transcripts_dir / "ignored_videos.txt").write_text(
+        "quiet1 # No subtitles available\n", encoding="utf-8"
+    )
+    downloaded: list[str] = []
+
+    def downloader(video_id: str):
+        downloaded.append(video_id)
+        if video_id == "quiet1":
+            raise AssertionError("ignored video must not reach the downloader")
+        return [
+            {"text": "linha um", "start": 0.0, "duration": 1.0},
+            {"text": "linha dois", "start": 1.0, "duration": 1.0},
+            {"text": "linha tres", "start": 2.0, "duration": 1.0},
+        ]
+
+    import mc.qdrant as q
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(q, "embed_passage", lambda texts: [[0.5] * 384 for _ in texts])
+    try:
+        code = update.run_update(
+            channels=("https://www.youtube.com/@test",),
+            state=state,
+            client=client,
+            collection=collection,
+            discover=lambda channels: ["quiet1", "fresh1"],
+            downloader=downloader,
+            metadata_fetch=lambda ids: {},
+            lock_path=tmp_path / "update.lock",
+            transcripts_dir=transcripts_dir,
+            queue_dir=tmp_path / "queue",
+        )
+    finally:
+        monkeypatch.undo()
+        client.delete_collection(collection)
+
+    assert code == 0
+    assert downloaded == ["fresh1"]  # the ignored video never reached download
+    assert not state.is_processed("quiet1")  # skipped, not ingested
+    assert state.is_processed("fresh1")
