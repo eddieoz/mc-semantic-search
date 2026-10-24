@@ -44,10 +44,22 @@ def _cmd_stats_backfill(
 ) -> int:
     from qdrant_client import QdrantClient
 
+    from mc import config
     from mc.config import DATA_DIR, QDRANT_URL
     from mc.ingest.lock import AlreadyRunning, RunLock
     from mc.ingest.stats_backfill import run_stats_backfill
     from mc.qdrant import client_kwargs
+
+    # D18: an unconfigured key must not "succeed" having done nothing — and
+    # must not even contend for the lock. Read via the config module at call
+    # time so tests (and operator env) can patch it.
+    if args.from_api and not config.YOUTUBE_API_KEY:
+        print(
+            "stats-backfill: --from-api needs YOUTUBE_API_KEY "
+            "(a GCP key restricted to the YouTube Data API v3) — "
+            "see docs/tasks/deploy-runbook.md"
+        )
+        return 1
 
     # The tab hydration pass (--from-tabs) is the longest job in the repo
     # (hours), and even the offline pass rewrites the same state DB — one
@@ -74,6 +86,23 @@ def _cmd_stats_backfill(
             from mc.ingest.stats_backfill import run_tab_backfill
 
             print(run_tab_backfill(client=client)["summary"])
+        # Story 9.4: --from-api is the same pre-pass against the YouTube Data
+        # API (minutes, ~150 quota units, no cookies). Quota exhaustion fails
+        # LOUD (D18) — silence would hide a misconfigured deployment, and the
+        # classic mop-up must not run on top of a dead run (writes are
+        # idempotent, so the partial work already committed stays).
+        if args.from_api:
+            from mc.ingest.stats_backfill import run_api_backfill
+            from mc.ingest.youtube_api import QuotaExceededError
+
+            try:
+                print(run_api_backfill(client=client)["summary"])
+            except QuotaExceededError as exc:
+                print(
+                    f"stats-backfill: YouTube API quota exhausted — {exc}. "
+                    "The quota resets daily and re-runs are idempotent."
+                )
+                return 1
         report = run_stats_backfill(
             fetch_missing=args.fetch_missing,
             limit=args.limit,
@@ -173,13 +202,27 @@ def build_parser() -> argparse.ArgumentParser:
         "mc_transcripts.db (authoritative and offline; junk episodes are "
         "cleared, rows/caches/payloads corrected)",
     )
-    p.add_argument(
+    # D19: one fact source per run — the two passes would interleave two
+    # writers on the same cache/rows for zero benefit. --from-tabs is
+    # retained, superseded, as the offline/cookie fallback.
+    source = p.add_mutually_exclusive_group()
+    source.add_argument(
         "--from-tabs",
         action="store_true",
         help="hydrate exact upload dates straight from the channel tabs: one "
         "uncapped yt-dlp full-extraction pass per /videos /streams /shorts "
         "tab (hours; randomized 3-8 s pacing; resumable/idempotent), then "
-        "the classic pass aligns rows/payloads from the richer cache",
+        "the classic pass aligns rows/payloads from the richer cache "
+        "(offline/cookie fallback — prefer --from-api)",
+    )
+    source.add_argument(
+        "--from-api",
+        action="store_true",
+        help="hydrate exact upload dates/durations/titles from the YouTube "
+        "Data API v3 (needs YOUTUBE_API_KEY; minutes, ~150 quota units of "
+        "the free 10,000/day, NO cookies and no bot gate; idempotent — a "
+        "re-run over complete rows costs 0 units), then the classic pass "
+        "aligns rows/payloads from the richer cache",
     )
     p.add_argument("--limit", type=int, default=None, help="cap videos considered this run")
     p.set_defaults(func=_cmd_stats_backfill)

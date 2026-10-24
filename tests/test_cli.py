@@ -178,3 +178,143 @@ def test_stats_backfill_refuses_to_overlap_with_a_held_lock(tmp_path, monkeypatc
 
     assert _cmd_stats_backfill(args, lock_path=tmp_path / "sb.lock") == 1
     assert "overlap" in capsys.readouterr().out.lower()
+
+
+# ---------------------------------------------------------------------------
+# Story 9.4 — `stats-backfill --from-api`: the YouTube Data API fact pass,
+# mutually exclusive with --from-tabs (D19 — two writers would interleave on
+# the same cache/rows for zero benefit). Missing key and quota exhaustion
+# fail LOUD with meaningful exit codes (D18) — an unconfigured key must not
+# "succeed" having done nothing.
+# ---------------------------------------------------------------------------
+
+
+def test_stats_backfill_accepts_from_api_flag():
+    from mc.cli import build_parser
+
+    args = build_parser().parse_args(["stats-backfill", "--from-api"])
+    assert args.from_api is True
+
+
+def test_from_api_and_from_tabs_are_mutually_exclusive(capsys):
+    """D19: one source per run — argparse rejects the pair outright."""
+    import pytest
+
+    from mc.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["stats-backfill", "--from-api", "--from-tabs"])
+    err = capsys.readouterr().err
+    assert "mutually exclusive" in err or "not allowed with" in err
+
+
+def test_from_api_missing_key_fails_before_the_lock(tmp_path, monkeypatch, capsys):
+    """An unconfigured key exits 1 with the runbook hint before contending
+    for the lock — and before any module call (D18)."""
+    import mc.config as config_mod
+    import mc.ingest.stats_backfill as sb_mod
+    from mc.cli import _cmd_stats_backfill, build_parser
+
+    monkeypatch.setattr(config_mod, "YOUTUBE_API_KEY", None)
+
+    def forbidden(**kw):
+        raise AssertionError("run_api_backfill must not run without a key")
+
+    acquire_calls: list[str] = []
+
+    def recorded_acquire(self):
+        acquire_calls.append("acquire")
+        from mc.ingest.lock import RunLock
+
+        return RunLock._orig_acquire(self) if hasattr(RunLock, "_orig_acquire") else None
+
+    monkeypatch.setattr(sb_mod, "run_api_backfill", forbidden)
+    monkeypatch.setattr(sb_mod, "run_stats_backfill", forbidden)
+    args = build_parser().parse_args(["stats-backfill", "--from-api", "--no-index"])
+
+    # the lock must never even be contended: acquire raising proves the
+    # command bailed out before it
+    def must_not_acquire(self):
+        raise AssertionError("the lock must not be acquired without a key")
+
+    monkeypatch.setattr("mc.ingest.lock.RunLock.acquire", must_not_acquire)
+
+    assert _cmd_stats_backfill(args, lock_path=tmp_path / "sb.lock") == 1
+    out = capsys.readouterr().out
+    assert "YOUTUBE_API_KEY" in out
+    assert "deploy-runbook" in out
+
+
+def test_from_api_runs_the_api_pass_before_the_classic_pass(
+    tmp_path, monkeypatch, capsys
+):
+    import mc.config as config_mod
+    import mc.ingest.stats_backfill as sb_mod
+    from mc.cli import _cmd_stats_backfill, build_parser
+
+    monkeypatch.setattr(config_mod, "YOUTUBE_API_KEY", "test-key")
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        sb_mod,
+        "run_api_backfill",
+        lambda **kw: calls.append("api") or {"summary": "stats-backfill api: API"},
+    )
+    monkeypatch.setattr(
+        sb_mod,
+        "run_stats_backfill",
+        lambda **kw: calls.append("classic") or {"summary": "stats-backfill: CLASSIC"},
+    )
+    args = build_parser().parse_args(["stats-backfill", "--from-api", "--no-index"])
+
+    assert _cmd_stats_backfill(args, lock_path=tmp_path / "sb.lock") == 0
+    assert calls == ["api", "classic"]
+    out = capsys.readouterr().out
+    assert out.index("stats-backfill api:") < out.index("CLASSIC")
+
+
+def test_from_api_quota_exhaustion_fails_loud(tmp_path, monkeypatch, capsys):
+    """D18: quota silence would hide a misconfigured deployment. The partial
+    work already committed stays (writes are idempotent) — but the classic
+    pass must not run on top of a dead run."""
+    import mc.config as config_mod
+    import mc.ingest.stats_backfill as sb_mod
+    from mc.cli import _cmd_stats_backfill, build_parser
+    from mc.ingest.youtube_api import QuotaExceededError
+
+    monkeypatch.setattr(config_mod, "YOUTUBE_API_KEY", "test-key")
+
+    calls: list[str] = []
+
+    def quota_dead(**kw):
+        calls.append("api")
+        raise QuotaExceededError("quotaExceeded", status=403)
+
+    monkeypatch.setattr(sb_mod, "run_api_backfill", quota_dead)
+    monkeypatch.setattr(
+        sb_mod,
+        "run_stats_backfill",
+        lambda **kw: calls.append("classic") or {"summary": "stats-backfill: CLASSIC"},
+    )
+    args = build_parser().parse_args(["stats-backfill", "--from-api", "--no-index"])
+
+    assert _cmd_stats_backfill(args, lock_path=tmp_path / "sb.lock") == 1
+    assert calls == ["api"]  # no classic mop-up on top of a dead run
+    assert "quota" in capsys.readouterr().out.lower()
+
+
+def test_from_api_refuses_to_overlap_with_a_held_lock(tmp_path, monkeypatch, capsys):
+    import mc.config as config_mod
+    from mc.cli import _cmd_stats_backfill, build_parser
+    from mc.ingest.lock import AlreadyRunning
+
+    monkeypatch.setattr(config_mod, "YOUTUBE_API_KEY", "test-key")
+
+    def held(self):
+        raise AlreadyRunning("another run holds the lock")
+
+    monkeypatch.setattr("mc.ingest.lock.RunLock.acquire", held)
+    args = build_parser().parse_args(["stats-backfill", "--from-api"])
+
+    assert _cmd_stats_backfill(args, lock_path=tmp_path / "sb.lock") == 1
+    assert "overlap" in capsys.readouterr().out.lower()
