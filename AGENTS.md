@@ -176,7 +176,10 @@ Runtime dirs, **gitignored**: `data/` (meta cache, queue, qdrant storage), `stat
 ## Configuration
 
 All knobs live in `src/mc/config.py`, read from the environment **at import time**.
-Model ids, dims, and the collection name are constants (not env-tunable).
+A gitignored `.env` at the repo root seeds `os.environ` first (`KEY=value` lines;
+real environment wins via `setdefault`, values never logged) — keep operator
+secrets there, never in crontabs or scripts. Model ids, dims, and the collection
+name are constants (not env-tunable).
 
 | Env var | Default | Purpose |
 |---|---|---|

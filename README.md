@@ -211,6 +211,12 @@ of truth; fingerprinted into the collection).
 
 ### Environment variables
 
+Knobs can live in a `.env` file at the repo root (`YOUTUBE_API_KEY=…`, one
+`KEY=value` per line; comments, `export` prefixes and quotes are handled).
+It is loaded at import time, **never overrides** a value already exported
+in the environment (cron/CI secrets win), and is gitignored — never commit
+it, treat it like `cookies.txt`.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant REST endpoint |

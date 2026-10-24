@@ -9,6 +9,34 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+
+def _load_dotenv(path: Path | None = None) -> None:
+    """Seed ``os.environ`` from a ``.env`` file (operator ergonomics).
+
+    The API key belongs in ``<repo>/.env``, not in a crontab line or a
+    wrapper script — cron does not read `.env`, and keys pasted into
+    crontabs leak into logs and editor histories. The real environment
+    always wins (``setdefault``, never override): an operator export or a
+    CI secret beats the file. Malformed lines are skipped, values are never
+    logged (NFR-5).
+    """
+    path = path or PROJECT_ROOT / ".env"
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        if text.startswith("export "):
+            text = text[len("export ") :]
+        key, sep, value = text.partition("=")
+        if not sep or not key.strip():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(key.strip(), value)
+
 # --- Models (NFR-6: baked into the image; fingerprinted into the collection) ---
 DENSE_MODEL_ID = "intfloat/multilingual-e5-small"
 DENSE_DIM = 384
@@ -17,6 +45,9 @@ SPARSE_LANGUAGE = "portuguese"
 
 # --- Paths ---
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# `.env` seeds the environment before any knob below reads it — after this
+# point every os.environ.get sees the file's values (real env still wins).
+_load_dotenv()
 DATA_DIR = Path(os.environ.get("MC_DATA_DIR", PROJECT_ROOT / "data"))
 STATE_DIR = Path(os.environ.get("MC_STATE_DIR", PROJECT_ROOT / "state"))
 QDRANT_DIR = DATA_DIR / "qdrant"
