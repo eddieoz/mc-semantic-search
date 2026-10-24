@@ -1,4 +1,5 @@
-"""One-off archive-facts backfill (Story 6.4; tab-driven date hydration: Story 8.1).
+"""One-off archive-facts backfill (Story 6.4; tab-driven date hydration: Story 8.1;
+YouTube Data API fact pass: Story 9.3).
 
 Fills ``video_stats`` for the videos already indexed, so the landing-page
 "status do acervo" shows full numbers from day one, and — for the same videos
@@ -39,6 +40,21 @@ is yt-dlp's own randomized sleep (3–8 s, the reference-script parameters)
 plus one process per tab instead of per video. Every write is idempotent:
 the cache merge never regresses known fields, the row upsert is COALESCE
 non-null-wins and the payload repair only fills empty fields.
+
+Story 9.3 adds ``run_api_backfill`` (--from-api): the tab pass died to the
+bot gate in production (a ~12 h run wrote zero rows — one authenticated
+request per video through a flagged session), while the YouTube Data API
+v3 serves the exact three facts the archive lacks (upload_date, duration,
+title ⇒ episode) for ~150 quota units of the free 10,000/day, with no
+cookies and no bot gate (D14). Discovery walks each configured channel's
+uploads playlist — the superset of /videos /streams /shorts, so all three
+tab types are covered at zero extra quota (D15) — and is unioned with the
+indexed universe so no indexed id is left behind. The write path is the
+tab pass's, byte for byte: cache merge non-regressing (poison healed),
+record_video_stats COALESCE, payload repair fills-empty. Complete rows are
+skipped BEFORE any API call, so a re-run after a full backlog run is
+seconds of local reads and 0 quota units (NFR-3). Missing key and quota
+exhaustion fail LOUD (D18) — the CLI turns them into an exit code.
 """
 
 from __future__ import annotations
@@ -63,6 +79,13 @@ from mc.ingest.metadata import (
     _parse_episode,
     duration_int,
     episode_int,
+)
+from mc.ingest.youtube_api import (
+    QuotaCounter,
+    YouTubeApiError,
+    fetch_channel_uploads,
+    fetch_video_facts,
+    iter_playlist_videos,
 )
 from mc.state import StateStore
 
@@ -662,5 +685,214 @@ def run_tab_backfill(
         "videos_dated": report.videos_dated,
         "cache_written": report.cache_written,
         "index_updated": report.index_updated,
+        "summary": report.summary(),
+    }
+
+
+@dataclass
+class ApiBackfillReport:
+    channels_resolved: int = 0  # channels whose uploads playlist was resolved
+    discovered: int = 0  # video ids the playlists yielded (D15 full discovery)
+    videos_seen: int = 0  # deduped universe processed this run
+    videos_dated: int = 0  # rows that gained a date this run
+    cache_written: int = 0  # cache files that gained a field
+    index_updated: int = 0  # payloads that gained a missing fact
+    still_missing: int = 0  # ids the API did not serve (deleted/private)
+    quota_units: int = 0  # YouTube Data API units consumed this run
+
+    def summary(self) -> str:
+        return (
+            f"stats-backfill api: {self.videos_seen} videos seen "
+            f"({self.discovered} discovered across {self.channels_resolved} channels), "
+            f"{self.videos_dated} dated, {self.cache_written} caches upgraded, "
+            f"{self.index_updated} index payloads repaired; "
+            f"{self.still_missing} still missing, {self.quota_units} quota units"
+        )
+
+
+class _ApiClient:
+    """Default adapter over the Story 9.2 client functions (Story 9.3).
+
+    One shared ``QuotaCounter`` threads the true running total through every
+    call so the report shows the run's actual cost. Stories 9.4/9.5 inject
+    fakes with the same three methods — tests never touch the network.
+    """
+
+    def __init__(self, api_key: str):
+        self._key = api_key
+        self._quota = QuotaCounter()
+
+    @property
+    def quota_units(self) -> int:
+        return self._quota.units
+
+    def channel_uploads(self, channels: tuple[str, ...] | list[str]) -> dict[str, str]:
+        return fetch_channel_uploads(self._key, channels=channels, quota=self._quota)
+
+    def playlist_videos(self, playlist_id: str) -> list[str]:
+        return list(iter_playlist_videos(self._key, playlist_id, quota=self._quota))
+
+    def video_facts(self, video_ids: list[str]) -> tuple[dict[str, dict], list[str]]:
+        return fetch_video_facts(self._key, video_ids, quota=self._quota)
+
+
+def run_api_backfill(
+    *,
+    state: StateStore | None = None,
+    cache_dir: Path | None = None,
+    client: QdrantClient | None = None,
+    collection: str = COLLECTION_NAME,
+    channels: tuple[str, ...] | list[str] | None = None,
+    api_client: object | None = None,
+    repair_index: bool = True,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Hydrate exact upload dates/durations/titles via the YouTube Data API
+    (Story 9.3, D14) through the tab pass's idempotent write path.
+
+    Discovery = every configured channel's uploads playlist (the superset of
+    /videos /streams /shorts — coverage contract #2) ∪ the indexed universe
+    (``state.processed`` ∪ cache ids — contract #3). Complete rows are
+    skipped before ANY API call — discovery included — so a re-run over a
+    healed archive costs 0 quota units (NFR-3). Ids the API does not serve
+    are counted as ``still_missing`` and never retried in-run (contract #4).
+    Missing key and quota exhaustion propagate (D18) — the CLI owns the
+    exit code.
+    """
+    state = state or StateStore(config.INGEST_DB_PATH)
+    cache_dir = Path(cache_dir) if cache_dir is not None else config.META_CACHE_DIR
+    if api_client is None:
+        # read at call time, not import time — the key is operator env state
+        api_key = config.YOUTUBE_API_KEY
+        if not api_key:
+            raise YouTubeApiError(
+                "stats-backfill: --from-api needs YOUTUBE_API_KEY "
+                "(a GCP key restricted to the YouTube Data API v3) — "
+                "see docs/tasks/deploy-runbook.md"
+            )
+        api_client = _ApiClient(api_key)
+    channel_urls = tuple(channels) if channels is not None else load_channels()
+
+    report = ApiBackfillReport()
+
+    # Complete rows are skipped BEFORE ANY API call — discovery included: a
+    # re-run after a full backlog run is seconds of local reads and 0 quota
+    # units (NFR-3). --from-api is a one-off backlog command, not scheduled;
+    # new videos are enriched by mc update's own pipeline, so a fully-healed
+    # local archive has nothing the API pass could add. A poisoned cache
+    # entry is never "complete" — the API truth heals it.
+    local_universe = set(state.processed_ids()) | _cache_ids(cache_dir)
+    pending: list[str] = []
+    for video_id in sorted(local_universe):
+        if _poisoned_episode(video_id, _load_cache(cache_dir, video_id)):
+            pending.append(video_id)
+            continue
+        current = state.video_facts(video_id)
+        if all(current[field] is not None for field in ("duration", "episode", "date")):
+            continue
+        pending.append(video_id)
+
+    discovered: set[str] = set()
+    if pending or not local_universe:
+        # Discovery: the uploads playlist is the superset of /videos /streams
+        # /shorts, so all three tab types are covered at zero extra quota (D15).
+        uploads: dict[str, str] = api_client.channel_uploads(channel_urls)
+        report.channels_resolved = len(uploads)
+        for playlist_id in uploads.values():
+            for video_id in api_client.playlist_videos(playlist_id):
+                if _VIDEO_ID_RE.fullmatch(video_id):
+                    discovered.add(video_id)
+                else:
+                    logger.warning("skipping invalid video id from %s: %r", playlist_id, video_id)
+        report.discovered = len(discovered)
+        # contract #3: the union guarantees no indexed id is left behind —
+        # discovered-only ids (no row, no cache) still gain "seen" rows
+        for video_id in sorted(discovered - local_universe):
+            pending.append(video_id)
+
+    report.videos_seen = len(pending)
+
+    facts_by_id: dict[str, dict] = {}
+    for start in range(0, len(pending), 50):
+        batch = pending[start : start + 50]
+        served, missing = api_client.video_facts(batch)
+        facts_by_id.update(served)
+        report.still_missing += len(missing)
+        # pacing is politeness, not survival — the API has no bot gate
+        sleeper(_FETCH_BACKOFF_S)
+
+    for video_id in pending:
+        raw_facts = facts_by_id.get(video_id)
+        if raw_facts is None:
+            continue  # deleted/private (contract #4) — counted, never fatal
+
+        # the same _normalize chain as the tab pass: upload_date "%Y%m%d" →
+        # ISO date, title → episode, so the cache keeps its vocabulary
+        meta = _normalize(
+            {
+                "upload_date": raw_facts.get("upload_date"),
+                "title": raw_facts.get("title") or "",
+                "duration": raw_facts.get("duration"),
+            }
+        )
+        cache = _load_cache(cache_dir, video_id)
+        poisoned = _poisoned_episode(video_id, cache)
+        fresh = {k: v for k, v in meta.items() if v is not None}
+        # non-poisoned: the cache is authoritative for fields it already knows
+        # (the pass fills gaps, it never churns); poisoned: poison is not
+        # knowledge and the API truth overwrites
+        merged = {**cache, **fresh} if poisoned else {**fresh, **cache}
+        if merged != cache:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            (cache_dir / f"{video_id}.json").write_text(json.dumps(merged), encoding="utf-8")
+            report.cache_written += 1
+
+        facts = {
+            "duration": duration_int(merged.get("duration")),
+            "episode": episode_int(merged.get("episode")),
+            "date": merged.get("date") or None,
+        }
+        try:
+            current = state.video_facts(video_id)
+            state.record_video_stats(
+                video_id,
+                duration=facts["duration"],
+                episode=facts["episode"],
+                date=facts["date"],
+            )
+            if current["date"] is None and facts["date"] is not None:
+                report.videos_dated += 1
+        except Exception:  # noqa: BLE001 — never fatal to the backfill
+            logger.warning("stats write failed for %s", video_id, exc_info=True)
+            continue
+
+        if repair_index and client is not None:
+            # the payload keeps episode as the string the ingest pipeline
+            # writes; only fields the index lacks are offered — except a
+            # poisoned episode, which must be REPLACED, not preserved
+            pending_payload = {
+                "duration": facts["duration"],
+                "episode": str(facts["episode"]) if facts["episode"] is not None else None,
+                "date": facts["date"],
+            }
+            missing = {f: v for f, v in pending_payload.items() if current[f] is None}
+            overwrite = {"episode"} if poisoned else set()
+            try:
+                if _repair_payload(client, collection, video_id, missing, overwrite=overwrite):
+                    report.index_updated += 1
+            except Exception:  # noqa: BLE001 — repair must never fail the run
+                logger.warning("index payload repair failed for %s", video_id, exc_info=True)
+
+    report.quota_units = api_client.quota_units
+    logger.info(report.summary())
+    return {
+        "channels_resolved": report.channels_resolved,
+        "discovered": report.discovered,
+        "videos_seen": report.videos_seen,
+        "videos_dated": report.videos_dated,
+        "cache_written": report.cache_written,
+        "index_updated": report.index_updated,
+        "still_missing": report.still_missing,
+        "quota_units": report.quota_units,
         "summary": report.summary(),
     }

@@ -13,6 +13,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from mc.ingest.discover import load_channels
 from mc.ingest.stats_backfill import run_stats_backfill
 from mc.state import StateStore
 
@@ -1164,3 +1167,263 @@ def test_tab_pass_salvages_partial_output_from_a_failed_tab(tmp_path):
     assert report["videos_seen"] == 2  # salvaged from the failed tab
     assert state.video_facts("abc747video")["date"] == "2024-03-15"
     assert state.video_facts("abc747nex9x")["date"] == "2024-03-20"
+
+
+# ---------------------------------------------------------------------------
+# Story 9.3 — `run_api_backfill`: the YouTube Data API fact pass (D14/D15).
+# Discovery (uploads playlists) ∪ indexed universe → batched facts → the SAME
+# write sequence as the tab pass: cache merge non-regressing, COALESCE row
+# upsert, fills-empty payload repair. Complete rows are skipped BEFORE any API
+# call, so a re-run after a full backlog run costs 0 quota units (NFR-3).
+# ---------------------------------------------------------------------------
+
+from mc.ingest.stats_backfill import run_api_backfill  # noqa: E402
+from mc.ingest.youtube_api import QuotaExceededError, YouTubeApiError  # noqa: E402
+
+
+class _FakeApiClient:
+    """Story 9.2 client stand-in: canned facts, no network, call counters."""
+
+    def __init__(
+        self,
+        facts: dict[str, dict],
+        *,
+        playlists: dict[str, str] | None = None,
+        discovered: list[str] | None = None,
+        missing: set[str] | None = None,
+    ):
+        self.facts = facts
+        self.playlists = playlists or {c: f"UU{i}" for i, c in enumerate(["chan"])}
+        self.discovered = list(discovered or [])
+        self.missing = set(missing or set())
+        self.facts_calls = 0
+        self.batches: list[list[str]] = []
+        self.quota_units = 0  # same shape as the real _ApiClient adapter
+
+    def channel_uploads(self, channels):
+        self.channel_calls = channels
+        return dict(self.playlists)
+
+    def playlist_videos(self, playlist_id):
+        return list(self.discovered)
+
+    def video_facts(self, ids):
+        self.facts_calls += 1
+        self.batches.append(list(ids))
+        served = {i: dict(self.facts[i]) for i in ids if i in self.facts}
+        missing = [i for i in ids if i in self.missing or i not in self.facts]
+        return served, missing
+
+
+def test_api_universe_is_discovery_union_index(tmp_path):
+    """Coverage contract #3: a video known only to the index still gets facts,
+    a video known only to discovery still gets a row (D15)."""
+    state, cache_dir, _ = _ctx(tmp_path)
+    state.mark_processed("idxonly", "update")
+    _write_cache(cache_dir, "cacheonly", {})
+    api = _FakeApiClient(
+        {
+            "idxonly": {"upload_date": "20260101", "title": "t", "duration": 60},
+            "cacheonly": {"upload_date": "20260102", "title": "t", "duration": 60},
+            "disconly001": {"upload_date": "20260103", "title": "t", "duration": 60},
+        },
+        discovered=["disconly001"],
+    )
+
+    report = run_api_backfill(
+        state=state, cache_dir=cache_dir, api_client=api, repair_index=False
+    )
+
+    assert report["videos_seen"] == 3
+    assert report["discovered"] == 1
+    assert report["channels_resolved"] == 1
+    assert state.video_facts("idxonly")["date"] == "2026-01-01"
+    assert state.video_facts("cacheonly")["date"] == "2026-01-02"
+    assert state.video_facts("disconly001")["date"] == "2026-01-03"
+
+
+def test_api_cache_merge_never_regresses_known_fields(tmp_path):
+    state, cache_dir, _ = _ctx(tmp_path)
+    _write_cache(cache_dir, "v1", {"duration": 999, "episode": "5", "date": "2020-01-01"})
+    api = _FakeApiClient({"v1": {"upload_date": "20260101", "title": "t", "duration": 100}})
+
+    run_api_backfill(state=state, cache_dir=cache_dir, api_client=api, repair_index=False)
+
+    facts = state.video_facts("v1")
+    assert facts["duration"] == 999
+    assert facts["episode"] == 5
+    assert facts["date"] == "2020-01-01"
+
+
+def test_api_poisoned_cache_entry_is_healed_by_api_truth(tmp_path):
+    """A placeholder-title poison (digits from the video id, no duration) is
+    not knowledge — the API facts REPLACE it, like the tab pass does."""
+    state, cache_dir, _ = _ctx(tmp_path)
+    _write_cache(cache_dir, "xg301415xZU", {"episode": "301415"})
+    api = _FakeApiClient(
+        {"xg301415xZU": {"upload_date": "20260101", "title": "[ IRL ][ ep 747 ] x", "duration": 60}}
+    )
+
+    report = run_api_backfill(state=state, cache_dir=cache_dir, api_client=api, repair_index=False)
+
+    assert state.video_facts("xg301415xZU")["episode"] == 747
+    assert report["cache_written"] == 1
+    stored = json.loads((cache_dir / "xg301415xZU.json").read_text())
+    assert stored["episode"] == "747"
+
+
+def test_api_episode_derived_from_api_title(tmp_path):
+    state, cache_dir, _ = _ctx(tmp_path)
+    api = _FakeApiClient(
+        {
+            "vid00000441": {
+                "upload_date": "20260101",
+                "title": "[ Morning Crypto ][ ep 441 ] x",
+                "duration": 60,
+            }
+        },
+        discovered=["vid00000441"],
+    )
+
+    run_api_backfill(state=state, cache_dir=cache_dir, api_client=api, repair_index=False)
+
+    assert state.video_facts("vid00000441")["episode"] == 441
+
+
+def test_api_payload_repair_fills_only_missing_fields(tmp_path):
+    """The payload repair is the tab pass's: only fields the index lacks are
+    offered, each scoped by the is-empty guard."""
+    state, cache_dir, _ = _ctx(tmp_path)
+    state.mark_processed("v1", "update")
+    state.record_video_stats("v1", duration=999)  # the row already knows duration
+    spy = _SpyClient()
+    api = _FakeApiClient(
+        {"v1": {"upload_date": "20260101", "title": "[ IRL ][ ep 747 ] x", "duration": 100}}
+    )
+
+    report = run_api_backfill(
+        state=state, cache_dir=cache_dir, client=spy, api_client=api
+    )
+
+    durations = [p["duration"] for p in spy.payloads() if "duration" in p]
+    assert durations == []  # the index's duration is knowledge, never re-offered
+    dates = [p["date"] for p in spy.payloads() if "date" in p]
+    assert dates == ["2026-01-01"]
+    episodes = [p["episode"] for p in spy.payloads() if "episode" in p]
+    assert episodes == ["747"]
+    assert report["index_updated"] == 1
+
+
+def test_api_complete_rows_skip_every_api_call(tmp_path):
+    """A re-run over complete rows is seconds of local reads and 0 quota
+    units — the fake client raises if it is touched at all."""
+    state, cache_dir, _ = _ctx(tmp_path)
+    state.mark_processed("v1", "update")
+    state.record_video_stats("v1", duration=60, episode=747, date="2026-01-01")
+
+    class _Untouched(_FakeApiClient):
+        def channel_uploads(self, channels):
+            raise AssertionError("discovery must not run for a complete universe")
+
+        def playlist_videos(self, playlist_id):
+            raise AssertionError("discovery must not run for a complete universe")
+
+        def video_facts(self, ids):
+            raise AssertionError("facts must not be fetched for a complete universe")
+
+    report = run_api_backfill(
+        state=state, cache_dir=cache_dir, api_client=_Untouched({}), repair_index=False
+    )
+
+    assert report["quota_units"] == 0
+    assert report["videos_seen"] == 0
+
+
+def test_api_missing_ids_are_counted_never_fatal(tmp_path):
+    """Deleted/private ids are counted as still missing (contract #4); every
+    other undated video is still dated."""
+    state, cache_dir, _ = _ctx(tmp_path)
+    state.mark_processed("goner", "update")
+    state.mark_processed("v1", "update")
+    api = _FakeApiClient(
+        {"v1": {"upload_date": "20260101", "title": "t", "duration": 60}},
+        missing={"goner"},
+    )
+
+    report = run_api_backfill(state=state, cache_dir=cache_dir, api_client=api, repair_index=False)
+
+    assert report["still_missing"] == 1
+    assert report["videos_dated"] == 1
+    assert state.video_facts("v1")["date"] == "2026-01-01"
+
+
+def test_api_quota_units_landed_in_the_report(tmp_path):
+    state, cache_dir, _ = _ctx(tmp_path)
+    api = _FakeApiClient({"v1": {"upload_date": "20260101", "title": "t", "duration": 60}})
+    api.quota_units = 7
+
+    report = run_api_backfill(state=state, cache_dir=cache_dir, api_client=api, repair_index=False)
+
+    assert report["quota_units"] == 7
+
+
+def test_api_quota_exceeded_propagates(tmp_path):
+    state, cache_dir, _ = _ctx(tmp_path)
+
+    class _QuotaDead(_FakeApiClient):
+        def channel_uploads(self, channels):
+            raise QuotaExceededError("quotaExceeded", status=403)
+
+    with pytest.raises(QuotaExceededError):
+        run_api_backfill(state=state, cache_dir=cache_dir, api_client=_QuotaDead({}))
+
+
+def test_api_other_api_error_propagates(tmp_path):
+    state, cache_dir, _ = _ctx(tmp_path)
+
+    class _Dead(_FakeApiClient):
+        def channel_uploads(self, channels):
+            raise YouTubeApiError("backendError", status=500)
+
+    with pytest.raises(YouTubeApiError):
+        run_api_backfill(state=state, cache_dir=cache_dir, api_client=_Dead({}))
+
+
+def test_api_missing_key_fails_loud_before_any_work(tmp_path, monkeypatch):
+    state, cache_dir, _ = _ctx(tmp_path)
+    state.mark_processed("v1", "update")
+    monkeypatch.setattr("mc.config.YOUTUBE_API_KEY", None)
+
+    with pytest.raises(YouTubeApiError, match="YOUTUBE_API_KEY"):
+        run_api_backfill(state=state, cache_dir=cache_dir, api_client=None)
+
+
+def test_api_paces_between_fact_batches(tmp_path):
+    state, cache_dir, _ = _ctx(tmp_path)
+    state.mark_processed("v1", "update")
+    api = _FakeApiClient({"v1": {"upload_date": "20260101", "title": "t", "duration": 60}})
+    slept: list[float] = []
+
+    run_api_backfill(
+        state=state, cache_dir=cache_dir, api_client=api, repair_index=False,
+        sleeper=slept.append,
+    )
+
+    assert len(slept) == 1  # one batch of facts → one politeness pause
+    assert slept[0] > 0
+
+
+def test_api_channels_default_to_load_channels(tmp_path, monkeypatch):
+    state, cache_dir, _ = _ctx(tmp_path)
+    seen: list[tuple] = []
+
+    class _Recording(_FakeApiClient):
+        def channel_uploads(self, channels):
+            seen.append(tuple(channels))
+            return {}
+
+    run_api_backfill(
+        state=state, cache_dir=cache_dir, api_client=_Recording({}), repair_index=False
+    )
+    # config.yaml's real channel list reaches the client untouched
+    assert seen and seen[0] == load_channels()

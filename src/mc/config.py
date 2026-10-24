@@ -56,3 +56,10 @@ CHANNELS = tuple(
     if line.strip()
 )
 COOKIES_PATH = os.environ.get("MC_COOKIES_PATH", str(PROJECT_ROOT / "cookies.txt"))
+
+# --- YouTube Data API v3 (stats-backfill --from-api, Story 9.3) ---
+# A GCP key RESTRICTED to the YouTube Data API v3 (+ server IP) — not a
+# cookie: the API path never touches the browser credential (NFR-5) and the
+# ban surface is the key's project, never the Google account. Unset → the
+# API pass fails loud with an operator-facing message (D18).
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY") or None
