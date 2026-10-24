@@ -33,3 +33,23 @@ def test_runbook_explains_why_fetch_defaults_off():
     low = RUNBOOK.lower()
     # fetching touches youtube → network + bot-detection exposure, hence off
     assert any(w in low for w in ("bot", "network", "rede", "yt-dlp", "fetch"))
+
+
+def test_runbook_documents_from_api_flag():
+    assert "--from-api" in RUNBOOK, "runbook must document `mc stats-backfill --from-api`"
+
+
+def test_runbook_documents_youtube_api_key_env():
+    assert "YOUTUBE_API_KEY" in RUNBOOK, "runbook must name the YOUTUBE_API_KEY env var"
+
+
+def test_runbook_mentions_key_restriction_or_quota():
+    low = RUNBOOK.lower()
+    assert any(
+        w in low for w in ("quota", "cota", "restrict", "restringir")
+    ), "runbook must cover restricting the key / the API quota"
+
+
+def test_runbook_says_api_path_needs_no_cookies():
+    low = RUNBOOK.lower()
+    assert "cookie" in low, "runbook must state the --from-api path involves no cookies"
