@@ -188,6 +188,21 @@ a video missing episode/date is fetched once via yt-dlp even when its duration
 is already known — that is what old pre-enrichment points need. An empty or
 unreadable table simply hides the block; the page never breaks on it.
 
+**Exact dates at scale (`--from-api`).** The temporal sort
+(`?sort=recent|oldest`) needs an exact upload date per video, and yt-dlp
+scraping died to the bot gate in production (a ~12 h run wrote zero rows).
+`mc stats-backfill --from-api` gets the three facts the archive lacks
+(exact `upload_date`, `duration`, `title` ⇒ episode) from the YouTube Data
+API v3 instead: each configured channel's uploads playlist is walked (the
+superset of /videos /streams /shorts) and unioned with the indexed
+universe, the whole backlog costs ~150 of the 10,000 free daily quota
+units, **no cookies are involved**, and the ban surface is the key's GCP
+project — never the Google account. Writes reuse the same idempotent
+doctrine (cache merge never regresses, rows are COALESCE, payloads
+fill-empty), so a re-run over complete rows costs 0 quota units. Missing
+key and exhausted quota fail loud with non-zero exit; key setup is in the
+deploy runbook.
+
 ## Configuration
 
 All knobs live in `src/mc/config.py` and are read from the environment at
@@ -211,6 +226,7 @@ of truth; fingerprinted into the collection).
 | `MC_TRANSCRIPTS_DIR` | `<repo>/transcripts` | Downloaded transcripts |
 | `MC_PUSH_DEST` | unset | rsync destination for `mc push` (Mode B), e.g. `server:/opt/mc/data/queue/` — must be the directory server-side `mc apply` watches |
 | `NOTIFY_WEBHOOK` | unset | Telegram-compatible webhook URL for cron failure alerts |
+| `YOUTUBE_API_KEY` | unset | GCP key **restricted to the YouTube Data API v3** for `mc stats-backfill --from-api` — no cookies involved; setup, restriction and quota math in the deploy runbook |
 | `MC_COMPOSE_TESTS` | unset | Set to `1` to run the compose smoke tests |
 
 Constants (not env-tunable): dense model `intfloat/multilingual-e5-small`
@@ -256,7 +272,7 @@ mc update --dry-run
 | `mc update [--dry-run]` | One daily pass: discover → download → chunk → embed → upsert → stage increment. `--dry-run` verifies cookies only |
 | `mc push` | rsync the staged increment to `$MC_PUSH_DEST` (Mode B) |
 | `mc apply` | Embed + upsert queued increments (Mode B server side); validates URLs/text/size, quarantines failures; no-op when the queue is empty |
-| `mc stats-backfill [--fetch-missing] [--no-index] [--from-db PATH] [--from-tabs] [--limit N]` | Repair `video_stats` + old Qdrant payloads; `--from-tabs` hydrates exact upload dates from the channel tabs (hours, residential IP — run detached) |
+| `mc stats-backfill [--fetch-missing] [--no-index] [--from-db PATH] [--from-tabs \| --from-api] [--limit N]` | Repair `video_stats` + old Qdrant payloads; `--from-api` hydrates exact upload dates/durations/titles from the YouTube Data API v3 (needs `YOUTUBE_API_KEY`; minutes, ~150 quota units, no cookies, idempotent — 0 units on a re-run over complete rows); `--from-tabs` is the retained offline/cookie fallback (hours, residential IP — run detached). The two are mutually exclusive |
 | `mc reindex --model ID` | Rebuild every chunk into a new collection (re-embeds) and swap the alias in one atomic update |
 | `mc eval --suite PATH [--limit 50] [--out FILE]` | Sparse-only vs hybrid MRR on known quotes; exits non-zero if hybrid regresses (cutover gate) |
 | `mc serve` | Run the search API on `$API_PORT` |

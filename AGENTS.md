@@ -64,7 +64,8 @@ src/mc/
 │   ├── apply.py          # Mode B server: validate + embed + upsert queued increments
 │   ├── backfill.py       # bootstrap from the legacy SQLite DB (resumable)
 │   ├── reindex.py        # rebuild into a new collection, swap alias atomically
-│   ├── stats_backfill.py # repair video_stats + old Qdrant payloads (episode/date/duration)
+│   ├── stats_backfill.py # repair video_stats + old Qdrant payloads (episode/date/duration); tab (--from-tabs) and YouTube Data API (--from-api) date passes
+│   ├── youtube_api.py    # YouTube Data API v3 client: ISO-8601 parsers, injectable transport, quota counter (Story 9.x)
 │   ├── legacy.py         # legacy DB reader (read-only; quarantines bad rows)
 │   ├── crosscheck.py     # transcript/DB consistency check
 │   ├── lock.py           # flock-based RunLock (cron overlap guard)
@@ -192,6 +193,7 @@ Model ids, dims, and the collection name are constants (not env-tunable).
 | `MC_TRANSCRIPTS_DIR` | `<repo>/transcripts` | Downloaded transcripts |
 | `MC_PUSH_DEST` | unset | rsync destination for `mc push` (Mode B) |
 | `NOTIFY_WEBHOOK` | unset | Telegram-compatible webhook for cron failure alerts |
+| `YOUTUBE_API_KEY` | unset | GCP key restricted to the YouTube Data API v3, for `mc stats-backfill --from-api`; the API path never touches cookies (NFR-5), missing key / exhausted quota fail loud (D18) |
 
 **Channels** live in `config.yaml` (committed; public URLs). `discover.load_channels()`
 reads it first, then the `MC_CHANNELS` env. Each channel is listed across its
@@ -206,7 +208,7 @@ channel automatically covers all three tabs (no code change).
 | `mc update [--dry-run]` | One daily pass: discover→download→chunk→embed→upsert→stage. `--dry-run` verifies cookies only |
 | `mc push` | rsync the staged increment to `$MC_PUSH_DEST` (Mode B) |
 | `mc apply` | Embed + upsert queued increments (Mode B server); validates + quarantines failures; no-op when empty |
-| `mc stats-backfill [--fetch-missing] [--no-index] [--from-db PATH] [--from-tabs] [--limit N]` | Repair `video_stats` + old Qdrant payloads; `--no-index` skips Qdrant, `--from-db` re-derives episodes offline, `--from-tabs` hydrates exact upload dates from the channel tabs (hours, randomized 3-8s pacing, residential IP) |
+| `mc stats-backfill [--fetch-missing] [--no-index] [--from-db PATH] [--from-tabs \| --from-api] [--limit N]` | Repair `video_stats` + old Qdrant payloads; `--no-index` skips Qdrant, `--from-db` re-derives episodes offline, `--from-api` hydrates exact upload dates/durations/titles from the YouTube Data API v3 (needs `YOUTUBE_API_KEY`; minutes, ~150 quota units, no cookies; the two source flags are mutually exclusive; `--from-tabs` is the retained offline fallback — hours, randomized 3-8s pacing, residential IP) |
 | `mc reindex --model ID` | Rebuild every chunk into a new collection and swap the alias atomically (old kept for rollback) |
 | `mc eval --suite PATH [--limit 50] [--out FILE]` | Sparse-only vs hybrid MRR; exits non-zero if hybrid regresses (cutover gate) |
 | `mc serve` | Run the search API on `$API_PORT` |
