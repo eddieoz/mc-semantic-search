@@ -14,12 +14,16 @@ Keep the wording stable: agents (and their caches) parse it literally.
 
 from __future__ import annotations
 
+from mc.config import PUBLIC_URL
+
 AGENT_NAME = "Muriel"
 
-# The archive's public identity. The paste-ready phrase must point at the
-# canonical domain no matter where the page was rendered (localhost, mirror,
-# proxy) — that URL is what carries the agent to the manual.
-PUBLIC_URL = "https://muriel.eddieoz.com"
+# The archive's public identity (config.PUBLIC_URL, overridable via MC_PUBLIC_URL).
+# The paste-ready phrase must point at the canonical domain no matter where the
+# page was rendered (localhost, mirror, proxy) — that URL is what carries the
+# agent to the manual. Re-exported here so the module's existing callers and its
+# own landing_box() keep referencing agent.PUBLIC_URL unchanged.
+__all__ = ["AGENT_NAME", "PUBLIC_URL", "endpoints", "landing_box", "manual", "llms_txt"]
 
 EXAMPLE_QUESTION = "quando o eddie falou sobre ilha das américas?"
 

@@ -30,6 +30,7 @@ from mc.config import (
     COLLECTION_NAME,
     FRESHNESS_MAX_HOURS,
     INGEST_DB_PATH,
+    PUBLIC_URL,
     QDRANT_URL,
 )
 from mc.qdrant import client_kwargs
@@ -171,20 +172,6 @@ def _safe_url(url: str | None, video_id: str | None) -> str:
     if video_id and _VIDEO_ID_RE.fullmatch(video_id):
         return f"https://www.youtube.com/watch?v={video_id}"
     return ""
-
-
-def _base_url(request: Request) -> str:
-    """Origin for the agent-facing docs, honoring reverse-proxy headers.
-
-    The host header is only ever echoed back inside JSON/text — never into
-    HTML — and an absent host falls back to relative endpoint recipes.
-    """
-    raw_scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
-    scheme = raw_scheme.split(",")[0].strip().lower()
-    if scheme not in ("http", "https"):
-        scheme = "https"
-    host = (request.headers.get("host") or request.url.netloc or "").strip()
-    return f"{scheme}://{host}" if host else ""
 
 
 def _search_results(results: list[dict]) -> list[dict]:
@@ -356,7 +343,7 @@ def create_app(
             took_ms = (time.perf_counter() - started) * 1000
             return JSONResponse(
                 {
-                    "agent": agent_docs.manual(_base_url(request)),
+                    "agent": agent_docs.manual(PUBLIC_URL),
                     "query": stripped,
                     "took_ms": took_ms,
                     "freshness": _freshness(),
@@ -377,8 +364,8 @@ def create_app(
         )
 
     @app.get("/llms.txt", response_class=PlainTextResponse)
-    def llms_txt_endpoint(request: Request) -> PlainTextResponse:
-        return PlainTextResponse(agent_docs.llms_txt(_base_url(request)))
+    def llms_txt_endpoint() -> PlainTextResponse:
+        return PlainTextResponse(agent_docs.llms_txt(PUBLIC_URL))
 
     @app.get("/health")
     def health_endpoint() -> JSONResponse:
