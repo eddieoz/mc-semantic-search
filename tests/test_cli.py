@@ -318,3 +318,92 @@ def test_from_api_refuses_to_overlap_with_a_held_lock(tmp_path, monkeypatch, cap
 
     assert _cmd_stats_backfill(args, lock_path=tmp_path / "sb.lock") == 1
     assert "overlap" in capsys.readouterr().out.lower()
+
+
+# ---------------------------------------------------------------------------
+# Story 10.4 — logging is configured at all: with no handler the library
+# default (WARNING) swallowed `mc update`'s INFO lines, so the "run summary"
+# never reached the cron log and a run that ingested nothing looked healthy.
+# Story 10.5 — `mc health` gates the cron on the state DB's last successful
+# ingest; the old `find -mmin` log gate could never fire because `>>`
+# refreshes the log file on every run.
+# ---------------------------------------------------------------------------
+
+
+def test_help_lists_health_subcommand():
+    result = _run_cli("--help")
+    assert result.returncode == 0
+    assert "health" in result.stdout, "missing subcommand health"
+
+
+def test_logging_is_configured_at_info_on_stderr(capsys):
+    import logging
+
+    from mc.cli import _configure_logging
+
+    _configure_logging("INFO")
+    logging.getLogger("mc.ingest.update").info("run summary: 0 new videos")
+
+    assert "run summary: 0 new videos" in capsys.readouterr().err
+
+
+def test_log_level_defaults_to_info_and_accepts_the_flag(monkeypatch):
+    from mc.cli import build_parser
+
+    monkeypatch.delenv("MC_LOG_LEVEL", raising=False)
+    assert build_parser().parse_args(["health"]).log_level == "INFO"
+    assert (
+        build_parser().parse_args(["--log-level", "debug", "health"]).log_level
+        == "DEBUG"
+    )
+    monkeypatch.setenv("MC_LOG_LEVEL", "warning")
+    assert build_parser().parse_args(["health"]).log_level == "WARNING"
+
+
+def _health_env(tmp_path):
+    return {
+        **os.environ,
+        "MC_STATE_DIR": str(tmp_path / "state"),
+        "MC_DATA_DIR": str(tmp_path / "data"),
+        "MC_TRANSCRIPTS_DIR": str(tmp_path / "transcripts"),
+    }
+
+
+def test_health_is_stale_without_a_recorded_success(tmp_path):
+    import json
+
+    result = subprocess.run(
+        [sys.executable, "-m", "mc.cli", "health", "--max-age-hours", "72"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env=_health_env(tmp_path),
+    )
+
+    assert result.returncode == 1
+    body = json.loads(result.stdout)
+    assert body["status"] == "stale"
+    assert body["last_update"] is None
+    assert body["max_age_hours"] == 72
+
+
+def test_health_ok_after_a_recent_success(tmp_path):
+    import json
+
+    from mc.state import StateStore
+
+    StateStore(tmp_path / "state" / "ingest.db").record_success("update")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "mc.cli", "health", "--max-age-hours", "72"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env=_health_env(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    body = json.loads(result.stdout)
+    assert body["status"] == "ok"
+    assert body["hours_since_update"] is not None
+    assert body["hours_since_update"] < 1

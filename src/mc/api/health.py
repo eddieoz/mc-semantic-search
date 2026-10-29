@@ -1,7 +1,11 @@
-"""Health snapshot with archive freshness (Story 4.6).
+"""Health snapshot with archive freshness (Story 4.6 / 10.5).
 
 The /health route stays a thin wrapper: all reachability + freshness
 logic lives in `health_snapshot` so it can be unit-tested without HTTP.
+
+Story 10.5: `freshness` is the single definition of "the ingest is fresh",
+shared by `/health` and `mc health` (the cron gate). A missing timestamp is
+stale there — an archive with no recorded success has never been ingested.
 """
 
 from __future__ import annotations
@@ -30,6 +34,21 @@ def _hours_since(ts: str | None) -> float | None:
         return (datetime.now(UTC) - parsed).total_seconds() / 3600
     except (ValueError, TypeError, OverflowError):
         return None
+
+
+def freshness(
+    state: StateStore, max_age_hours: int
+) -> tuple[str, str | None, float | None]:
+    """``(status, last_update, age_hours)`` from the recorded ingest success.
+
+    ``status`` is ``"ok"`` only when a success is recorded and its age is
+    within ``max_age_hours``; a missing/unparseable timestamp is ``"stale"``
+    (nothing was ever ingested — that is not a healthy archive)."""
+    last_update = state.last_success(LAST_SUCCESS_KEY)
+    age_hours = _hours_since(last_update)
+    if age_hours is None or age_hours > max_age_hours:
+        return "stale", last_update, age_hours
+    return "ok", last_update, age_hours
 
 
 def health_snapshot(

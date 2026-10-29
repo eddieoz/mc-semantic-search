@@ -2,13 +2,37 @@
 
 Subcommands are wired to their story implementations as the epic proceeds;
 the skeleton exits non-zero for unknown commands and prints usage.
+
+Story 10.4 (NFR-3): logging is configured here, not left to the library
+default. Without a handler every INFO line — including `mc update`'s
+"discovery summary" and "dry run: N new videos" — was dropped, so a cron run
+that ingested nothing looked exactly like a healthy one.
+
+Story 10.5: `mc health` is the cron freshness gate. It reads the state DB's
+last successful ingest (`last_success("update")`), so it fires when the
+archive stopped growing — unlike a log-mtime check, which `>>` refreshes on
+every run.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import sys
 from pathlib import Path
+
+
+def _configure_logging(level: str = "INFO") -> None:
+    """Send library logs to stderr at ``level`` (cron captures stderr).
+
+    ``force=True`` so an operator's pre-existing handler (or a re-run in the
+    same process) cannot silently keep the level at WARNING."""
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
 
 
 def _cmd_backfill(args: argparse.Namespace) -> int:
@@ -152,10 +176,55 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_health(args: argparse.Namespace) -> int:
+    """Report ingest freshness from the state DB; exit 1 when stale (Story 10.5)."""
+    import json
+
+    from mc.api.health import freshness
+    from mc.config import INGEST_DB_PATH
+    from mc.state import StateStore
+
+    try:
+        status, last_update, age_hours = freshness(
+            StateStore(INGEST_DB_PATH), args.max_age_hours
+        )
+    except Exception as exc:  # noqa: BLE001 — an unreadable state DB is stale
+        # Read-path failure isolation: never crash the cron job with a
+        # traceback; a health probe that cannot read state must fail closed.
+        print(f"health: cannot read the ingest state db: {exc}")
+        return 1
+
+    print(
+        json.dumps(
+            {
+                "status": status,
+                "last_update": last_update,
+                "hours_since_update": None if age_hours is None else round(age_hours, 2),
+                "max_age_hours": args.max_age_hours,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0 if status == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
+    from mc.config import FRESHNESS_MAX_HOURS
+
     parser = argparse.ArgumentParser(
         prog="mc",
         description="Morning Crypto semantic search operations CLI",
+    )
+    # Story 10.4: the level is a global option so every subcommand logs at
+    # INFO by default (the cron log needs the discovery summary). It is read
+    # from the environment at parser-build time — a crontab can set
+    # MC_LOG_LEVEL=DEBUG without changing the job line.
+    parser.add_argument(
+        "--log-level",
+        default=os.environ.get("MC_LOG_LEVEL", "INFO").upper(),
+        type=str.upper,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="log verbosity for every subcommand (env MC_LOG_LEVEL; default INFO)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -240,12 +309,25 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("serve", help="run the search API")
     p.set_defaults(func=_cmd_serve)
 
+    p = sub.add_parser(
+        "health",
+        help="exit 1 when the last successful ingest is older than the window",
+    )
+    p.add_argument(
+        "--max-age-hours",
+        type=int,
+        default=FRESHNESS_MAX_HOURS,
+        help=f"staleness window in hours (env FRESHNESS_MAX_HOURS; default {FRESHNESS_MAX_HOURS})",
+    )
+    p.set_defaults(func=_cmd_health)
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _configure_logging(args.log_level)
     try:
         return args.func(args)
     except KeyboardInterrupt:
