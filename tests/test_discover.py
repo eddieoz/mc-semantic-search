@@ -1,15 +1,24 @@
-"""Story 3.1 — channel video listing via yt-dlp --flat-playlist.
+"""Story 3.1 / 10.1 — channel video listing.
 
 Discovery-tabs design (2026-10-22): every configured channel is listed
 across its /videos, /streams and /shorts tabs — Morning Crypto episodes are
 live streams and only appear under /streams. Video ids are exactly 11 chars;
 anything else (playlist-type entries from degraded listings, traversal
 shapes) is skipped with a warning.
+
+Story 10.1 (2026-10-29): a tab listing is a bounded window (``--playlist-end``
+entries per tab), so anything older than the window was invisible to every
+run — the bug that made ~150 published videos unreachable. When
+``YOUTUBE_API_KEY`` is set, discovery walks the channel's full uploads
+playlist instead (page after page, no window); the tabs stay as the fallback
+and a tab that returns the whole cap is a loud truncation error, never a
+silently short listing.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -19,12 +28,49 @@ from mc.ingest.discover import DiscoveryError, list_channel_videos
 
 FIXTURE = Path(__file__).parent / "fixtures" / "flat_playlist.json"
 
-CHANNEL_URL = "https://www.youtube.com/channel/UCexample12345"
+CHANNEL_URL = "https://www.youtube.com/channel/UCexample123456789012345"
+
+
+@pytest.fixture(autouse=True)
+def _tabs_by_default(monkeypatch):
+    """Unit tests must never touch the network.
+
+    ``list_channel_videos`` prefers the Data API when a key is configured; an
+    operator ``.env`` holding a real ``YOUTUBE_API_KEY`` would otherwise turn
+    every tab test into a live API call. The API-path tests opt in by passing
+    ``api_key=``/``transport=`` explicitly.
+    """
+    import mc.config as config
+
+    monkeypatch.setattr(config, "YOUTUBE_API_KEY", None)
 
 
 @pytest.fixture
 def playlist_fixture() -> dict:
     return json.loads(FIXTURE.read_text())
+
+
+def _api_transport(pages: list[list[str]], uploads: str = "UUexample12345"):
+    """Fake YouTube Data API transport: channels.list → one uploads playlist,
+    playlistItems.list → one page per index in ``pages``."""
+    from mc.ingest.youtube_api import CHANNELS_URL, PLAYLIST_ITEMS_URL
+
+    def transport(url: str, params: dict) -> dict:
+        if url == CHANNELS_URL:
+            return {"items": [{"contentDetails": {"relatedPlaylists": {"uploads": uploads}}}]}
+        assert url == PLAYLIST_ITEMS_URL, url
+        assert params["playlistId"] == uploads
+        index = int(params.get("pageToken", "0"))
+        body: dict = {
+            "items": [
+                {"contentDetails": {"videoId": video_id}} for video_id in pages[index]
+            ]
+        }
+        if index + 1 < len(pages):
+            body["nextPageToken"] = str(index + 1)
+        return body
+
+    return transport
 
 
 def _fake_run(returncode=0, stdout="", stderr=""):
@@ -72,9 +118,9 @@ def test_tabs_appended_per_channel(monkeypatch):
     monkeypatch.setattr("mc.ingest.discover._run_ytdlp", run)
     list_channel_videos([CHANNEL_URL])
     assert [u.split("/channel/")[1] for u in calls] == [
-        "UCexample12345/videos",
-        "UCexample12345/streams",
-        "UCexample12345/shorts",
+        "UCexample123456789012345/videos",
+        "UCexample123456789012345/streams",
+        "UCexample123456789012345/shorts",
     ]
 
 
@@ -250,3 +296,130 @@ def test_ytdlp_timeout_raises_discovery_error(monkeypatch):
     monkeypatch.setattr("mc.ingest.discover.subprocess.run", run)
     with pytest.raises(DiscoveryError, match="timed out"):
         list_channel_videos(["https://www.youtube.com/@x"])
+
+
+# --- Story 10.1: API-first discovery -------------------------------------
+
+
+def test_api_discovery_enumerates_beyond_the_tab_window(monkeypatch):
+    """The whole uploads playlist, page after page — not a 50-entry window.
+
+    This is the fix for videos published before the tab window: with the API
+    available, a 60-video channel yields all 60 (two pages) and yt-dlp is
+    never shelled out."""
+    import mc.config as config
+
+    monkeypatch.setattr(config, "YOUTUBE_API_KEY", "test-key")
+    ids = [f"vid{index:08d}" for index in range(60)]  # exactly 11 chars
+    assert all(len(video_id) == 11 for video_id in ids)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("yt-dlp must not run when the API path works")
+
+    monkeypatch.setattr("mc.ingest.discover._run_ytdlp", forbidden)
+    found = list_channel_videos(
+        [CHANNEL_URL], transport=_api_transport([ids[:50], ids[50:]])
+    )
+    assert found == set(ids)
+
+
+def test_api_failure_falls_back_to_tabs(monkeypatch, caplog):
+    """An API outage degrades to the old tab path — the run still discovers."""
+    import mc.config as config
+    from mc.ingest.youtube_api import YouTubeApiError
+
+    monkeypatch.setattr(config, "YOUTUBE_API_KEY", "test-key")
+    calls = []
+
+    def run(listing_url, **kwargs):
+        calls.append(listing_url)
+        return _fake_run(0, json.dumps({"entries": [{"id": "aaaabbbbbcc"}]}), "")(
+            listing_url, **kwargs
+        )
+
+    monkeypatch.setattr("mc.ingest.discover._run_ytdlp", run)
+
+    def transport(url: str, params: dict) -> dict:
+        raise YouTubeApiError("boom", status=500)
+
+    with caplog.at_level(logging.WARNING, logger="mc.ingest.discover"):
+        ids = list_channel_videos([CHANNEL_URL], transport=transport)
+
+    assert ids == {"aaaabbbbbcc"}
+    assert len(calls) == 3  # /videos, /streams, /shorts
+    assert any("falling back" in record.message.lower() for record in caplog.records)
+
+
+def test_api_empty_result_falls_back_to_tabs(monkeypatch):
+    """A key that resolves no channel (renamed/deleted handle) must not mean
+    'the archive is empty' — the tabs still get their chance."""
+    import mc.config as config
+
+    monkeypatch.setattr(config, "YOUTUBE_API_KEY", "test-key")
+    calls = []
+
+    def run(listing_url, **kwargs):
+        calls.append(listing_url)
+        return _fake_run(0, json.dumps({"entries": [{"id": "aaaabbbbbcc"}]}), "")(
+            listing_url, **kwargs
+        )
+
+    monkeypatch.setattr("mc.ingest.discover._run_ytdlp", run)
+
+    def transport(url: str, params: dict) -> dict:
+        return {"items": []}
+
+    assert list_channel_videos([CHANNEL_URL], transport=transport) == {"aaaabbbbbcc"}
+    assert calls
+
+
+def test_explicit_empty_api_key_uses_tabs(monkeypatch):
+    """``api_key=""`` means 'no API' — the tabs run and no API call is made."""
+    calls = []
+
+    def run(listing_url, **kwargs):
+        calls.append(listing_url)
+        return _fake_run(0, json.dumps({"entries": [{"id": "aaaabbbbbcc"}]}), "")(
+            listing_url, **kwargs
+        )
+
+    monkeypatch.setattr("mc.ingest.discover._run_ytdlp", run)
+
+    def transport(url: str, params: dict) -> dict:
+        raise AssertionError("no API call expected without a key")
+
+    assert list_channel_videos([CHANNEL_URL], api_key="", transport=transport) == {
+        "aaaabbbbbcc"
+    }
+    assert len(calls) == 3
+
+
+def test_tab_limit_is_env_tunable(monkeypatch):
+    """The tab window is configuration, not a magic 50 in the command line."""
+    import mc.config as config
+
+    monkeypatch.setattr(config, "DISCOVERY_TAB_LIMIT", 7)
+    seen = {}
+
+    def run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return _fake_run(0, json.dumps({"entries": []}), "")(cmd, **kwargs)
+
+    monkeypatch.setattr("mc.ingest.discover.subprocess.run", run)
+    list_channel_videos([CHANNEL_URL])
+    index = seen["cmd"].index("--playlist-end")
+    assert seen["cmd"][index + 1] == "7"
+
+
+def test_tab_returning_the_whole_cap_is_a_truncation_error(monkeypatch):
+    """A tab that fills the window may have more behind it: ingesting a
+    silently truncated listing is exactly the bug 10.1 fixes, so it must be
+    loud (and it names the knob)."""
+    import mc.config as config
+
+    monkeypatch.setattr(config, "DISCOVERY_TAB_LIMIT", 2)
+    stdout = json.dumps({"entries": [{"id": "aaaabbbbbcc"}, {"id": "cccdddddeee"}]})
+    monkeypatch.setattr("mc.ingest.discover._run_ytdlp", _fake_run(0, stdout, ""))
+
+    with pytest.raises(DiscoveryError, match="truncat"):
+        list_channel_videos([CHANNEL_URL])

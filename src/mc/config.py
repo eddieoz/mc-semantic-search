@@ -88,6 +88,13 @@ CHANNELS = tuple(
 )
 COOKIES_PATH = os.environ.get("MC_COOKIES_PATH", str(PROJECT_ROOT / "cookies.txt"))
 
+# Story 10.1: the tab fallback is a *window* (``--playlist-end`` entries per
+# tab). A channel publishing more than this between runs loses the older
+# videos, so the window is generous and a tab that returns the whole cap is
+# a loud truncation error instead of a silent short listing. The API path
+# (YOUTUBE_API_KEY) has no window and is preferred whenever a key is set.
+DISCOVERY_TAB_LIMIT = int(os.environ.get("MC_DISCOVERY_TAB_LIMIT", "500"))
+
 # --- YouTube Data API v3 (stats-backfill --from-api, Story 9.3) ---
 # A GCP key RESTRICTED to the YouTube Data API v3 (+ server IP) — not a
 # cookie: the API path never touches the browser credential (NFR-5) and the
