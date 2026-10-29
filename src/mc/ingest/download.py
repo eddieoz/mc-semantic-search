@@ -1,12 +1,17 @@
-"""Transcript download (Story 3.2): yt-dlp subtitle fetch with retry logic.
+"""Transcript download (Story 3.2 / 10.3): yt-dlp subtitle fetch with retry.
 
 Ports the proven v3 pipeline logic into the mc package:
 
 - language priority ['pt', 'pt-BR', 'en', 'en-US'], one language per attempt;
 - json3 subtitle format; parsed transcript saved as ``<video_id>.srt`` (v3
   naming kept for consistency) and the temp json3 removed;
-- 429 / "Too Many Requests" errors get exponential-backoff retries, then the
-  next language; permanent failure appends to ``ignored_videos.txt``;
+- 429 / "Too Many Requests" errors get exponential-backoff retries; once the
+  budget is spent the download raises ``RateLimitedError`` (Story 10.3) —
+  a 429 is IP-level, so trying the next language just burns more requests,
+  and ignore-listing the video would hide it from every later run. The
+  caller classifies it as transient and retries the video next run;
+- a clean "no subtitles" result (yt-dlp wrote nothing) is the only path that
+  appends to ``ignored_videos.txt``;
 - a cached ``.srt`` short-circuits the download entirely.
 
 Cookies come in as a parameter (config resolves ``MC_COOKIES_PATH`` via
@@ -41,6 +46,13 @@ MAX_RETRIES = 3
 
 class DownloadError(RuntimeError):
     """Actionable failure before or during transcript download."""
+
+
+class RateLimitedError(DownloadError):
+    """YouTube kept answering 429 after the backoff budget (Story 10.3).
+
+    Transient by nature: the caller must fail the run and retry the video on
+    the next pass — never write it to ``ignored_videos.txt``."""
 
 
 def _youtube_url(video_id: str) -> str:
@@ -249,10 +261,13 @@ def _attempt_language(
 ) -> list[dict] | None:
     """Try one language; backoff on 429; other failures raise to the caller.
 
-    Rate-limit errors retry with backoff and then fall through to the next
-    language. Any other failure propagates so ``run_update`` can classify it
-    (auth-shaped errors are never ignore-listed); a merely subtitle-less
-    video raises nothing — yt-dlp exits cleanly without writing the file.
+    Rate-limit errors retry with backoff and then raise ``RateLimitedError``
+    (Story 10.3): a 429 is IP-level, so the next language would be answered
+    the same way, and ``run_update`` must retry the video tomorrow instead of
+    ignore-listing it forever. Any other failure propagates so ``run_update``
+    can classify it (auth-shaped errors are never ignore-listed); a merely
+    subtitle-less video raises nothing — yt-dlp exits cleanly without writing
+    the file.
     """
     try:
         run(url, ydl_opts)
@@ -261,6 +276,7 @@ def _attempt_language(
             logger.warning("subtitle attempt failed for %s: %s", url, exc)
             raise
         logger.warning("rate limited, retrying with backoff")
+        last_error: BaseException = exc
         for retry in range(max_retries):
             delay = (2**retry) * 10 + random.uniform(2, 15)
             logger.info("retry %d/%d — waiting %.1fs", retry + 1, max_retries, delay)
@@ -270,14 +286,12 @@ def _attempt_language(
             except Exception as retry_exc:
                 if not _is_rate_limit_error(retry_exc):
                     raise
-                if retry == max_retries - 1:
-                    logger.warning(
-                        "max retries reached, trying next language: %s", retry_exc
-                    )
-                    return None
+                last_error = retry_exc
                 continue
             return _consume_subtitle(subtitle_file, transcript_path)
-        return None
+        raise RateLimitedError(
+            f"still rate limited after {max_retries} retries for {url}: {last_error}"
+        ) from last_error
     return _consume_subtitle(subtitle_file, transcript_path)
 
 

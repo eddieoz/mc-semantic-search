@@ -102,27 +102,37 @@ def test_cached_srt_short_circuits(tmp_path):
     assert rec.call_count == 0
 
 
-def test_rate_limit_backoff_then_next_language(tmp_path, monkeypatch):
+def test_rate_limit_exhaustion_raises_transient_error(tmp_path, monkeypatch):
+    """A 429 is IP-level: retrying the next language from the same IP just
+    burns more requests, and ignore-listing the video would hide it forever.
+    After the backoff budget the download raises ``RateLimitedError`` — the
+    caller classifies it as transient and retries the video tomorrow."""
+    from mc.ingest.download import RateLimitedError
+
     jitterless = lambda a, b: 0.0  # noqa: E731
     monkeypatch.setattr("random.uniform", jitterless)
     delays: list[float] = []
     rec = Recorder(
-        behavior=lambda *_: (_ for _ in ()).throw(RuntimeError("HTTP Error 429: Too Many Requests"))
+        behavior=lambda *_: (_ for _ in ()).throw(
+            RuntimeError("HTTP Error 429: Too Many Requests")
+        )
     )
 
-    result = download_transcript(
-        VIDEO_ID,
-        cookies_path=_write_cookies(tmp_path),
-        transcripts_dir=tmp_path / "transcripts",
-        sleeper=delays.append,
-        runner=rec,
-    )
+    with pytest.raises(RateLimitedError):
+        download_transcript(
+            VIDEO_ID,
+            cookies_path=_write_cookies(tmp_path),
+            transcripts_dir=tmp_path / "transcripts",
+            sleeper=delays.append,
+            runner=rec,
+        )
 
-    assert result is None
-    # Per language: 1 initial attempt + 3 backoff retries.
-    assert rec.call_count == 4 * (1 + 3)
-    # 2**retry * 10 with zero jitter, then move to the next language.
-    assert delays == [10, 20, 40] * len(LANGUAGE_PRIORITY)
+    # One language only: 1 initial attempt + 3 backoff retries, then stop.
+    assert rec.call_count == 1 + 3
+    # 2**retry * 10 with zero jitter.
+    assert delays == [10, 20, 40]
+    # Never ignore-listed: the next run must retry it.
+    assert not (tmp_path / "transcripts" / "ignored_videos.txt").exists()
 
 
 def test_permanent_failure_appends_ignore_list_once(tmp_path):
