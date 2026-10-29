@@ -1,4 +1,4 @@
-# mc-semantic-search — Mode A crontab: server self-update (Story 5.1)
+# mc-semantic-search — Mode A crontab: server self-update (Story 5.1 / 10.5)
 # ============================================================
 #
 # INSTALL (as root on the server):
@@ -6,17 +6,23 @@
 #   ... or non-interactively:
 #     crontab /opt/mc/crontab.example
 #
-# PATHS: /opt/mc is the repo checkout on the server (docker-compose.yml
-# lives there). Adjust the three paths if the checkout sits elsewhere.
+# PATHS: MC_HOME is the repo checkout on the server (docker-compose.yml
+# lives there). Every job line uses $MC_HOME — edit the ONE env line below
+# if the checkout sits elsewhere (cron passes these assignments into the
+# job's environment, so the shell expands them).
 #
 # NOTIFY HOOK: NOTIFY_WEBHOOK is a Telegram-compatible webhook URL, e.g.
 #     NOTIFY_WEBHOOK=https://api.telegram.org/bot<token>/sendMessage
-# Every job ends with `|| (…curl……)`: if the job exits non-zero (or the
-# update log is STALE — see the -mmin staleness gate on the update line,
-# 72h = FRESHNESS_MAX_HOURS) curl fires a POST to the webhook. Cron does
-# not read your shell environment: define the variable HERE, before the
-# job lines. Set it to a plain value (cron takes everything after `=`
-# literally, no quote stripping).
+# Every job ends with `|| (…curl……)`: if the job exits non-zero curl fires a
+# POST to the webhook. Cron does not read your shell environment: define the
+# variable HERE, before the job lines. Set it to a plain value (cron takes
+# everything after `=` literally, no quote stripping).
+#
+# FRESHNESS GATE: the update job ends with `mc health --max-age-hours 72`
+# (Story 10.5). It asks the state DB when the last ingest actually succeeded,
+# so a run that "completed" without ingesting anything still alerts. Do NOT
+# go back to a `find -mmin` gate on the log: `>>` refreshes the log's mtime
+# on every run, so that gate can never fire.
 #
 # PRIVACY: the webhook URL embeds a bot token, so jobs never put it in
 # curl's argv (visible to every local user via `ps`). Instead they write
@@ -24,28 +30,30 @@
 # --config. NOTE: cron eats a bare `%`, so the printf format escapes it
 # as `\%` below.
 #
+MC_HOME=/opt/mc
 NOTIFY_WEBHOOK=https://api.telegram.org/botCHANGE-ME/sendMessage
 
 # --- jobs --------------------------------------------------------------------
-# 1) DAILY UPDATE 06:15 — discover -> download -> chunk -> embed -> upsert.
-#    compose has no `ingest` service: `docker compose run --rm ingest update`
-#    from the epic maps onto the existing `api` service + `mc.cli update`
-#    (the image must ship src/mc/cli.py + src/mc/ingest/; alternatively run
-#    the update from the host venv: .venv/bin/python -m mc.cli update).
-#    The `find -mmin -4320` staleness gate alerts when the log has not been
-#    written for >72h even if the command itself exits 0.
-15 6 * * * flock -n /run/lock/mc-update.lock sh -c 'cd /opt/mc && docker compose run --rm api python -m mc.cli update >> /var/log/mc-update.log 2>&1 && find /var/log/mc-update.log -mmin -4320 -print | grep -q .' || (umask 077 && printf 'url = "\%s"\n' "$NOTIFY_WEBHOOK" > /run/lock/mc-notify.curl && curl -s --config /run/lock/mc-notify.curl -X POST -H 'Content-Type: application/json' -d '{"text":"mc update FAILED (non-zero exit or stale >72h)"}'; rm -f /run/lock/mc-notify.curl)
+# 1) DAILY UPDATE 06:15 — discover -> download -> chunk -> embed -> upsert,
+#    then the freshness gate. compose has no `ingest` service: `docker compose
+#    run --rm api ...` maps onto the existing api service + `mc.cli update`
+#    (the image ships src/mc/cli.py + src/mc/ingest/). -T: cron has no TTY, so
+#    compose must not try to allocate one. `cd` into $MC_HOME so compose reads
+#    the repo's docker-compose.yml and bind mounts ./data ./state.
+#    YOUTUBE_API_KEY (and any other operator secret) lives in $MC_HOME/.env —
+#    the API discovery path never uses cookies (NFR-5).
+15 6 * * * flock -n /run/lock/mc-update.lock sh -c 'cd "$MC_HOME" && docker compose run --rm -T api sh -c "python -m mc.cli update && python -m mc.cli health --max-age-hours 72" >> /var/log/mc-update.log 2>&1' || (umask 077 && printf 'url = "\%s"\n' "$NOTIFY_WEBHOOK" > /run/lock/mc-notify.curl && curl -s --config /run/lock/mc-notify.curl -X POST -H 'Content-Type: application/json' -d '{"text":"mc update FAILED (non-zero exit, or no successful ingest within 72h)"}'; rm -f /run/lock/mc-notify.curl)
 
 # 2) NIGHTLY SNAPSHOT 03:00 — Story 5.3 backup entry (rotation keeps last 7).
 #    Backup is a pure HTTP call to qdrant, so it runs from the host venv —
-#    no image rebuild needed. Snapshot files land in /opt/mc/snapshots
+#    no image rebuild needed. Snapshot files land in $MC_HOME/snapshots
 #    (docker volume ./snapshots:/qdrant/snapshots).
-0 3 * * * flock -n /run/lock/mc-snapshot.lock sh -c 'cd /opt/mc && .venv/bin/python -m mc.backup create --keep 7 >> /var/log/mc-snapshot.log 2>&1' || (umask 077 && printf 'url = "\%s"\n' "$NOTIFY_WEBHOOK" > /run/lock/mc-notify.curl && curl -s --config /run/lock/mc-notify.curl -X POST -d '{"text":"mc snapshot FAILED"}'; rm -f /run/lock/mc-notify.curl)
+0 3 * * * flock -n /run/lock/mc-snapshot.lock sh -c 'cd "$MC_HOME" && .venv/bin/python -m mc.backup create --keep 7 >> /var/log/mc-snapshot.log 2>&1' || (umask 077 && printf 'url = "\%s"\n' "$NOTIFY_WEBHOOK" > /run/lock/mc-notify.curl && curl -s --config /run/lock/mc-notify.curl -X POST -d '{"text":"mc snapshot FAILED"}'; rm -f /run/lock/mc-notify.curl)
 
 # 3) WEEKLY APPLY SANITY 05:00 Sunday — the Mode B queue should be empty on
 #    Mode A, so `mc apply` must be a no-op that exits 0; any other outcome
 #    (non-zero exit) is drift and fires the notify hook.
-0 5 * * 0 flock -n /run/lock/mc-apply.lock sh -c 'cd /opt/mc && docker compose run --rm api python -m mc.cli apply >> /var/log/mc-apply.log 2>&1' || (umask 077 && printf 'url = "\%s"\n' "$NOTIFY_WEBHOOK" > /run/lock/mc-notify.curl && curl -s --config /run/lock/mc-notify.curl -X POST -d '{"text":"mc apply sanity FAILED"}'; rm -f /run/lock/mc-notify.curl)
+0 5 * * 0 flock -n /run/lock/mc-apply.lock sh -c 'cd "$MC_HOME" && docker compose run --rm -T api python -m mc.cli apply >> /var/log/mc-apply.log 2>&1' || (umask 077 && printf 'url = "\%s"\n' "$NOTIFY_WEBHOOK" > /run/lock/mc-notify.curl && curl -s --config /run/lock/mc-notify.curl -X POST -d '{"text":"mc apply sanity FAILED"}'; rm -f /run/lock/mc-notify.curl)
 
 # NOTES
 # - flock -n: a daily run that is still busy (or a cron/snapshot overlap)
@@ -54,4 +62,8 @@ NOTIFY_WEBHOOK=https://api.telegram.org/botCHANGE-ME/sendMessage
 #   local user could pre-hold the locks and silently skip the daily jobs.
 # - All log paths are absolute (cron may run from / and `>>` relative
 #   paths would land somewhere else).
+# - First run after a discovery fix ingests the whole backlog (one metadata
+#   fetch + one subtitle download per video, minutes to hours): run it by
+#   hand once with `docker compose run --rm api python -m mc.cli update`
+#   instead of waiting for cron. See docs/tasks/deploy-runbook.md §3.
 # - Restore procedure: docs/tasks/backup-restore.md (Story 5.3 runbook).

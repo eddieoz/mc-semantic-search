@@ -53,3 +53,40 @@ def test_runbook_mentions_key_restriction_or_quota():
 def test_runbook_says_api_path_needs_no_cookies():
     low = RUNBOOK.lower()
     assert "cookie" in low, "runbook must state the --from-api path involves no cookies"
+
+
+# ---------------------------------------------------------------------------
+# Story 10.6 — the runbook must describe the repaired ingest: API-first
+# discovery (no bounded tab window), the state-based health gate, and the
+# manual ignore-list prune (a poisoned list cannot be pruned automatically —
+# a 429 entry is indistinguishable from a genuinely subtitle-less video).
+# ---------------------------------------------------------------------------
+
+
+def test_runbook_documents_discovery_api_path():
+    assert "MC_DISCOVERY_TAB_LIMIT" in RUNBOOK, (
+        "runbook must document the tab-window knob used when no API key is set"
+    )
+    low = RUNBOOK.lower()
+    assert "uploads playlist" in low or "playlist de uploads" in low, (
+        "runbook must explain that discovery walks the whole uploads playlist"
+    )
+
+
+def test_runbook_documents_health_gate():
+    assert "mc.cli health" in RUNBOOK or "mc health" in RUNBOOK, (
+        "runbook must document the cron health gate"
+    )
+    assert "last_success" in RUNBOOK or "último ingest" in RUNBOOK.lower(), (
+        "runbook must say the gate reads the last successful ingest"
+    )
+
+
+def test_runbook_documents_ignore_list_prune():
+    assert "ignored_videos.txt" in RUNBOOK, (
+        "runbook must document pruning the ignore list by hand"
+    )
+    low = RUNBOOK.lower()
+    assert "429" in RUNBOOK or "truncat" in low or "ignore list" in low, (
+        "runbook must explain which entries are safe to remove"
+    )

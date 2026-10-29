@@ -98,10 +98,27 @@ def test_notify_hook_documented_with_curl_pattern():
     assert "Telegram" in CRONTAB, "webhook should be documented as Telegram-compatible"
 
 
-def test_staleness_gate_documented():
-    assert any("-mmin" in ln for ln in _job_lines(CRONTAB)), (
-        "update line must include the staleness gate (alert on stale log)"
+def test_freshness_gate_uses_the_ingest_state_not_the_log():
+    """Story 10.5: the gate must ask the state DB when the last ingest
+    succeeded. A `find -mmin` gate on the log can never fire — `>>` refreshes
+    the file's mtime on every run, however empty the run was."""
+    update_jobs = [ln for ln in _job_lines(CRONTAB) if "mc.cli update" in ln]
+    assert update_jobs, "no daily update line found"
+    line = update_jobs[0]
+    assert "mc.cli health --max-age-hours" in line, (
+        "update job must end with `mc.cli health --max-age-hours N`"
     )
+    assert "-mmin" not in line, "log-mtime gate is meaningless with `>>`"
+
+
+def test_jobs_use_the_mc_home_variable():
+    """One place to edit when the checkout is not /opt/mc: the repo path is an
+    env assignment, never hardcoded inside a job line."""
+    assert re.search(r"^MC_HOME=", CRONTAB, re.MULTILINE), (
+        "crontab must define MC_HOME (the repo checkout)"
+    )
+    for line in _job_lines(CRONTAB):
+        assert "/opt/mc" not in line, f"job must use $MC_HOME, not a hardcoded path: {line}"
 
 
 def test_install_instructions_present():
