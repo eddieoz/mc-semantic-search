@@ -148,9 +148,9 @@ def test_short_chunk_has_no_ellipses():
 def test_oversized_sentence_centers_on_query_term():
     """Old-era chunks are one giant unpunctuated 'sentence': the slice must
     center on the first query term so the <mark> survives the cut."""
-    filler_a = "palavra de enchimento " * 30  # ~420 chars before the topic
+    filler_a = "palavra de enchimento " * 40  # ~880 chars before the topic
     topic = "a teoria da ilha das américas explica o cenário geopolítico atual "
-    filler_b = "mais enchimento irrelevante aqui " * 12  # ~460 chars after
+    filler_b = "mais enchimento irrelevante aqui " * 22  # ~726 chars after
     snip = build_snippet(filler_a + topic + filler_b, "ilha das américas")
     plain = re.sub(r"<[^>]+>", "", snip.highlighted)
     assert "<mark>ilha</mark>" in snip.highlighted
