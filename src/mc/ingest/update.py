@@ -1,9 +1,17 @@
-"""Daily ingestion orchestrator (Story 3.4).
+"""Daily ingestion orchestrator (Story 3.4 / 10.2).
 
 Discover → download → chunk → embed → upsert → mark processed, one
 atomic per-video transaction at a time. Chunk records are staged to
 ``data/queue/pending.jsonl`` so ``mc push``/``mc apply`` (Mode B) ship
 exactly the same increment that Mode A indexes directly.
+
+Story 10.2 (NFR-3) closes the silent-empty-run hole: an empty discovery, a
+discovered backlog that is entirely ignore-listed, and any transient failure
+(429/timeout/5xx) all fail the run (exit 1) without recording a successful
+ingest — so the health gate keeps alerting instead of reporting "up to date"
+while the archive stops growing. Every run logs a discovery summary at INFO
+before any early return, so "nothing new" is distinguishable from "nothing
+found" in the cron log.
 """
 
 from __future__ import annotations
@@ -57,10 +65,33 @@ _AUTH_MARKERS = (
     "unauthorized",
 )
 
+# Story 10.2: a transient failure is the network's fault, not the video's.
+# Ignore-listing it (the pre-fix behaviour) hid the video from every later
+# run — that is how production accumulated a permanently poisoned list.
+_TRANSIENT_MARKERS = (
+    "429",
+    "too many requests",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection aborted",
+    "temporarily unavailable",
+    "502",
+    "503",
+    "504",
+)
+
 
 def is_auth_failure(reason: str) -> bool:
     lowered = (reason or "").lower()
     return any(marker in lowered for marker in _AUTH_MARKERS)
+
+
+def is_transient_failure(reason: str) -> bool:
+    """True for retryable failures (rate limit, timeout, 5xx) — never ignored."""
+    lowered = (reason or "").lower()
+    return any(marker in lowered for marker in _TRANSIENT_MARKERS)
+
 
 
 class StagingError(RuntimeError):
@@ -99,6 +130,16 @@ def run_update(
     lock_path = lock_path or DATA_DIR / "update.lock"
 
     discovered = list(discover(channels))
+    if not discovered:
+        # Story 10.2: an empty listing is an outage or a broken config, never
+        # "up to date". Failing loud (and not recording success) keeps the
+        # health gate alerting instead of reporting a fresh archive.
+        logger.error(
+            "discovery returned no videos for %d channel(s) — refusing to report success",
+            len(channels),
+        )
+        return 1
+
     # An ignore-listed video is a KNOWN uninjestable (permanently subtitle-less):
     # re-attempting it every run failed the whole pass and fired the cron alert
     # forever (observed in production with wtptWokZag8). The list is a
@@ -111,9 +152,36 @@ def run_update(
         logger.info(
             "%d discovered videos are in the ignore list — skipped", len(ignored)
         )
-    new_ids = sorted(
-        vid for vid in discovered if not state.is_processed(vid) and vid not in ignored
+    unprocessed = [vid for vid in discovered if not state.is_processed(vid)]
+    new_ids = sorted(vid for vid in unprocessed if vid not in ignored)
+
+    # Story 10.2: logged at INFO before any early return — the cron log must
+    # let the operator tell "nothing new" from "nothing found".
+    logger.info(
+        "discovery summary: %d discovered, %d already processed, %d ignored, "
+        "%d new videos",
+        len(discovered),
+        len(discovered) - len(unprocessed),
+        len(ignored),
+        len(new_ids),
     )
+
+    if not unprocessed:
+        logger.info("nothing to do — archive is up to date")
+        if not dry_run:
+            state.record_success("update")
+        return 0
+
+    if not new_ids:
+        # Every discovered-but-unprocessed video is ignore-listed: the
+        # pipeline cannot make progress. That is a failure, not a clean run.
+        logger.error(
+            "no progress: all %d unprocessed discovered videos are ignore-listed — "
+            "prune transcripts/%s if the entries are wrong (e.g. past 429s)",
+            len(unprocessed),
+            IGNORE_LIST_FILENAME,
+        )
+        return 1
 
     if dry_run:
         logger.info("dry run: %d new videos would be ingested", len(new_ids))
@@ -154,11 +222,23 @@ def run_update(
                     )
                     failures.append((video_id, f"staging: {reason}"))
                     continue
+                if is_transient_failure(reason):
+                    # Story 10.2: retry tomorrow, never ignore-list — a 429 is
+                    # IP-level, and writing it to the list hides the video
+                    # from every later run.
+                    logger.error(
+                        "transient failure for %s (%s) — will be retried next run",
+                        video_id,
+                        reason,
+                    )
+                    failures.append((video_id, f"transient: {reason}"))
+                    continue
                 logger.exception("video %s failed", video_id)
                 failures.append((video_id, reason))
                 add_to_ignore_list(
                     video_id, transcripts_dir / IGNORE_LIST_FILENAME, reason
                 )
+
 
         logger.info(
             "run summary: %d new videos, %d indexed, %d failed",
